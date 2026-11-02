@@ -1,9 +1,7 @@
 # PAM service for mu-dsh web sign-ins and password changes, used by the
-# mu-dsh daemon (root). Installed by install.sh as /etc/pam.d/mu-dsh; local
-# edits are kept.
+# mu-dsh daemon. Installed by install.sh as /etc/pam.d/mu-dsh; local edits
+# are kept. Password changes run like passwd(1), so the site's usual
+# common-password rules apply.
 @include common-auth
 @include common-account
-# The daemon runs as root, for which pam_pwquality only warns; enforce the
-# site's rules (/etc/security/pwquality.conf) here, then run the usual stack.
-password requisite pam_pwquality.so enforce_for_root
 @include common-password

@@ -6,8 +6,7 @@ DSH_VERSION=$1
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y --no-install-recommends python3 curl ca-certificates xz-utils procps iproute2 sudo \
-    libpam-pwquality cracklib-runtime
+apt-get install -y --no-install-recommends python3 curl ca-certificates xz-utils procps iproute2 sudo
 
 # Node.js from the official tarball (Debian's packaged Node is too old for dsh).
 tar -xJf /root/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \

@@ -294,10 +294,10 @@ class FakePam:
         self.checked.append(user)
         return password == "right"
 
-    def change(self, user, new_password):
-        if len(new_password) < 8:
+    def change(self, user, current, new):
+        if len(new) < 8:
             return "The password is shorter than 8 characters"
-        self.changed.append((user, new_password))
+        self.changed.append((user, new))
         return None
 
 

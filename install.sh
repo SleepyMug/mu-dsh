@@ -6,8 +6,7 @@
 #   sudo ./install.sh --uninstall --purge also delete every managed user's Unix account and
 #                                         home, and /etc/mu-dsh, /var/lib/mu-dsh, /var/cache/mu-dsh
 #
-# Requires: python3 >= 3.11, node >= 23.6 with npm, systemd, PAM (Debian-style common-*),
-# and libpam-pwquality.
+# Requires: python3 >= 3.11, node >= 23.6 with npm, systemd, PAM (Debian-style common-*).
 set -eu
 
 PREFIX=/opt/mu-dsh
@@ -71,14 +70,6 @@ for tool in useradd userdel chpasswd pkill pgrep; do
     command -v "$tool" >/dev/null || die "$tool not found"
 done
 ldconfig -p 2>/dev/null | grep -q 'libpam\.so\.0' || die "libpam (libpam0g) not found"
-exists_any() { for f in "$@"; do [ -e "$f" ] && return 0; done; return 1; }
-exists_any /usr/lib/*/security/pam_pwquality.so /lib/*/security/pam_pwquality.so \
-    || die "pam_pwquality not found (apt install libpam-pwquality); it enforces password rules for web changes"
-# pwquality's dictionary check (on by default) refuses every password when the dictionary is missing.
-if ! exists_any /usr/share/cracklib/pw_dict.pwd* /var/cache/cracklib/cracklib_dict.pwd* \
-    && ! grep -Eq '^[[:space:]]*dictcheck[[:space:]]*=[[:space:]]*0' /etc/security/pwquality.conf 2>/dev/null; then
-    die "no cracklib dictionary: apt install cracklib-runtime, or set dictcheck = 0 in /etc/security/pwquality.conf"
-fi
 
 # --- service account ---------------------------------------------------------
 if ! id "$SVC_USER" >/dev/null 2>&1; then

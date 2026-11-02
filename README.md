@@ -19,6 +19,45 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
    └──► upstream LLM (real key)
 ```
 
+## Usage
+
+**Setup**
+1. Prerequisites: systemd, Python 3.11+, Node.js 23.6+ with npm.
+2. `git clone git@github.com:SleepyMug/mu-dsh.git && cd mu-dsh && sudo ./install.sh`
+3. `sudoedit /etc/mu-dsh/config.toml` — public URL and the `[llm]` section.
+4. `sudo systemctl enable --now mu-dsh` (first start downloads dsh from npm).
+
+**Users** (each is a Unix account mu-dsh creates and owns)
+- Add (creates the account): `sudo mu-dsh user add alice`
+- Set password (admin, no rules applied): `sudo mu-dsh user passwd alice`
+- Disable / enable (stops dsh and web sign-in): `sudo mu-dsh user disable|enable alice`
+- New relay key: `sudo mu-dsh user rotate-key alice`
+- Remove (deletes account and home): `sudo mu-dsh user del alice`
+- List: `sudo mu-dsh user list`
+
+**dsh update**
+1. Change `[dsh] version` in `config.toml`.
+2. `sudo systemctl restart mu-dsh`
+
+**Model configuration**
+1. Edit `[llm]` (`base_url`, `api_key`, `default_model`) and `[[llm.models]]` in `config.toml`.
+2. `sudo systemctl reload mu-dsh`
+
+**mu-dsh update**
+- `git pull && sudo ./install.sh && sudo systemctl restart mu-dsh`
+
+**Uninstall**
+- Keep users and data: `sudo ./install.sh --uninstall`
+- Remove everything, including user accounts: `sudo ./install.sh --uninstall --purge`
+
+**Logs**
+- `journalctl -u mu-dsh -u mu-dsh-gateway`
+
+**What users do**
+1. Open the public URL; sign in with their Unix user name and password.
+2. They land in their own dsh. `/` has "Change password" and "Sign out".
+3. A web password change follows the same rules as `passwd` and changes the Unix password; `passwd` in a shell works too.
+
 ## Components
 
 | Part | Language | Runs as | Role |
@@ -57,11 +96,10 @@ accounts cannot sign in. Only managed, enabled users can sign in to the web.
 
 Signed-in users get a small portal at `/` (open the workspace, change password,
 sign out). The password page at `/account/password` checks the current
-password and sets the new one through PAM (`pam_chauthtok`), so it changes the
-Unix password and follows the site's rules in `/etc/security/pwquality.conf`;
-mu-dsh adds none of its own. `/etc/pam.d/mu-dsh` runs `pam_pwquality` with
-`enforce_for_root`, because the daemon making the change is root. (`mu-dsh
-user add`/`passwd` are admin actions and set passwords directly.)
+password and sets the new one through PAM the way `passwd` does (a helper whose
+real uid is the user), so it changes the Unix password and follows the site's
+usual rules; mu-dsh adds none of its own. (`mu-dsh user add`/`passwd` are admin
+actions and set passwords directly.)
 
 ### What mu-dsh writes in a user's home
 
@@ -93,7 +131,7 @@ the same configuration.
 
 ## Install
 
-Prerequisites: systemd, `libpam-pwquality` and `cracklib-runtime`, `python3` ≥ 3.11, Node.js ≥ 23.6 with `npm` on `PATH`
+Prerequisites: systemd, `python3` ≥ 3.11, Node.js ≥ 23.6 with `npm` on `PATH`
 (Debian 13's packaged Node is too old; use the nodejs.org tarball or NodeSource),
 and network access to the npm registry (or a mirror) on first start.
 

@@ -37,8 +37,8 @@ REFUSAL_DELAY = 2.0  # roughly pam_unix's failure delay, so refusals all look al
 class Authenticator(Protocol):
     def check(self, user: str, password: str) -> bool: ...
 
-    def change(self, user: str, new_password: str) -> str | None:
-        """Set a new password under the site's rules; returns the reason it was refused, or None."""
+    def change(self, user: str, current: str, new: str) -> str | None:
+        """Change the password under the site's rules; returns the reason it was refused, or None."""
         ...
 
 
@@ -70,7 +70,7 @@ class AuthServer:
 
     def change_password(self, user: str, current: str, new: str) -> str | None:
         """Set a new Unix password after checking the current one. Password rules
-        come from PAM (pam_pwquality); returns its complaint, or None on success."""
+        come from PAM, as for passwd(1); returns its complaint, or None on success."""
         if not self.check(user, current):
             return "The current password is wrong."
         if new == current:
@@ -79,7 +79,7 @@ class AuthServer:
             check_password(new)  # one line, no NULs: what PAM and the protocol can carry
         except AccountError as e:
             return str(e).capitalize() + "."
-        error = self.authenticator.change(user, new)
+        error = self.authenticator.change(user, current, new)
         if error is None:
             log.info("password changed for %s from the web", user)
         else:
