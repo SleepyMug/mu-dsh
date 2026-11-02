@@ -39,7 +39,8 @@ def cmd_install_dsh(s: Services, args) -> int:
 
 def cmd_check_config(s: Services, args) -> int:
     cfg = s.config_file.load()
-    print(f"{s.config_file.path}: OK (public URL {cfg.gateway.public_url}, {len(cfg.llm.models)} model(s), dsh {cfg.dsh.version})")
+    reach = cfg.gateway.public_url or "any of this host's addresses"
+    print(f"{s.config_file.path}: OK (reached at {reach}, {len(cfg.llm.models)} model(s), dsh {cfg.dsh.version})")
     return 0
 
 
@@ -49,6 +50,8 @@ def cmd_user_add(s: Services, args) -> int:
     password = _read_password(args)
     user = s.admin.add(args.name, password, cfg.dsh.port_base)
     print(f"created Unix account {user.name} (dsh port {user.port}): {cfg.gateway.public_url}/u/{user.name}/")
+    if not cfg.gateway.public_url:
+        print("  (no public_url set: users open http://<this host>:<gateway port>/)")
     return 0
 
 

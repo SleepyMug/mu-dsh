@@ -24,7 +24,8 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 **Setup**
 1. Prerequisites: systemd, Python 3.11+, Node.js 23.6+ with npm.
 2. `git clone git@github.com:SleepyMug/mu-dsh.git && cd mu-dsh && sudo ./install.sh`
-3. `sudoedit /etc/mu-dsh/config.toml` — public URL and the `[llm]` section.
+3. `sudoedit /etc/mu-dsh/config.toml` — the `[llm]` section; optionally `public_url`
+   (left out, users open `http://<any of this host's IPv4 addresses or names>:8080/`).
 4. `sudo systemctl enable --now mu-dsh` (first start downloads dsh from npm).
 
 **Users** (each is a Unix account mu-dsh creates and owns)
@@ -118,6 +119,9 @@ the same configuration.
 
 ### How sign-in works
 
+0. dsh only accepts requests whose `Host` is one it trusts. With `public_url`
+   set, that is its host name; without it, each dsh trusts the machine's own
+   global IPv4 addresses, hostname, and FQDN (found at start or reload).
 1. `POST /login` asks the daemon to check the Unix password (PAM) and sets the
    gateway's `mu_dsh_session` cookie.
 2. `/u/<user>/*` is proxied only for that user. The original `Host` header is

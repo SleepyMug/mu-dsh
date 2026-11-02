@@ -475,21 +475,43 @@ class SystemTest(unittest.TestCase):
         wait_until(lambda: self.relay_status(old_key) == "401", timeout=30, what="old key rejected")
         self.assertEqual(self.relay_status(new_key), "200")
 
-    def test_17_service_restart(self):
+    def test_17_without_public_url(self):
+        """IP-only deployments: with no public_url, the host's own addresses and names work."""
+        config = self.sh("cat /etc/mu-dsh/config.toml").stdout
+        self.assertIn("public_url", config)
+        old_pid = self.dsh_pid(20000)
+        self.sh("sed -i '/^public_url/d' /etc/mu-dsh/config.toml && systemctl reload mu-dsh")
+        wait_until(lambda: (pid := self.dsh_pid(20000)) is not None and pid != old_pid, what="alice's dsh restarted")
+        self.wait_up("alice", "bob")
+        ip = self.sh("ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1").stdout.strip()
+        hostname = self.sh("hostname").stdout.strip()
+        for host in (ip, hostname):
+            b = Browser(self.vm.http_port, host)
+            self.assertEqual(b.login("alice", PASSWORDS["alice"]).status, 303)
+            chain = b.follow("/u/alice/")
+            self.assertEqual(chain[-1].status, 200, (host, [(r.status, r.header("location")) for r in chain]))
+            self.assertIn(" 101 ", b.websocket_status("/u/alice/api/remote.mux") + " ")
+        # Restore the configured public URL for the remaining tests.
+        self.sh("cat > /etc/mu-dsh/config.toml", input=config)
+        self.sh("systemctl reload mu-dsh")
+        wait_until(lambda: self.dsh_pid(20000) not in (None, old_pid) and self.gateway_state()["users"]["alice"]["up"]
+                   and self.signed_in("alice") is not None, what="gw.test trusted again")
+
+    def test_18_service_restart(self):
         self.sh("systemctl restart mu-dsh", timeout=300)
         wait_until(lambda: self.sh("systemctl is-active mu-dsh-gateway", check=False).stdout.strip() == "active", what="gateway active")
         self.wait_up("alice", "bob")
         self.signed_in("alice")
         self.signed_in("bob")
 
-    def test_18_reboot(self):
+    def test_19_reboot(self):
         self.sh("systemctl reboot", check=False, timeout=15)
         time.sleep(5)
         self.vm.wait_ssh(timeout=300)
         self.wait_up("alice", "bob", timeout=300)
         self.signed_in("alice")
 
-    def test_19_user_del(self):
+    def test_20_user_del(self):
         self.sh("runuser -u alice -- nohup sleep 600 </dev/null >/dev/null 2>&1 &")  # a stray process of alice's
         self.assertEqual(self.sh("pgrep -x sleep", check=False).returncode, 0)
         out = self.sh("mu-dsh user del alice")
@@ -502,7 +524,7 @@ class SystemTest(unittest.TestCase):
         self.assertNotIn("alice", self.gateway_state()["users"])
         self.assertTrue(self.gateway_state()["users"]["bob"]["up"])
 
-    def test_20_uninstall(self):
+    def test_21_uninstall(self):
         self.sh("cd /root/mu-dsh && ./install.sh --uninstall --purge", timeout=120)
         for path in ["/opt/mu-dsh", "/etc/mu-dsh", "/var/lib/mu-dsh", "/usr/local/bin/mu-dsh", "/usr/local/bin/dsh",
                      "/etc/systemd/system/mu-dsh.service"]:

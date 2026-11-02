@@ -4,9 +4,11 @@
 [gateway]
 # Where browsers connect. Unlike dsh itself, the gateway may bind a wildcard address.
 listen = "0.0.0.0:8080"
-# The URL users type, without a path. Its host name is what dsh trusts as
-# the browser-visible authority, so it must match what users actually open.
-public_url = "http://gw.example.internal:8080"
+# Optional: the URL users type, without a path, e.g. "https://gw.example.internal".
+# Set it when users reach the gateway through a name or proxy this host does
+# not know itself. Left out, users can open the gateway at any of this host's
+# own IPv4 addresses, its hostname, or its FQDN.
+# public_url = "http://gw.example.internal:8080"
 # Lifetime of a gateway sign-in.
 session_max_age_days = 30
 # Unix group the gateway runs as; it may read /run/mu-dsh/gateway.json.

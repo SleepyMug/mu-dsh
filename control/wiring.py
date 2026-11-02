@@ -15,6 +15,7 @@ from control.changes import Changes
 from control.config import ConfigFile
 from control.daemon import Daemon
 from control.dshinstall import DshInstaller
+from control.hostnames import HostNames
 from control.pam import PamAuthenticator
 from control.paths import Paths
 from control.pidfile import PidFile
@@ -66,7 +67,7 @@ def build_daemon(services: Services) -> Daemon:
         users=services.users,
         accounts=services.accounts,
         installer=services.installer,
-        specs=SpecBuilder(services.installer),
+        specs=SpecBuilder(services.installer, HostNames()),
         supervisor=Supervisor(Launcher(services.provisioner), changes),
         changes=changes,
         state_file=services.state_file,

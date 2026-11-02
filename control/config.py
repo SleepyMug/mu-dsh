@@ -33,7 +33,7 @@ class Listen:
 @dataclass(frozen=True)
 class GatewayConfig:
     listen: Listen
-    public_url: str  # normalized, no trailing slash
+    public_url: str  # normalized, no trailing slash; empty: reachable by any of the host's own addresses
     session_max_age_days: int
     group: str  # group that may read gateway.json
 
@@ -148,7 +148,9 @@ def _model(raw: object, index: int) -> dict:
 
 def parse(data: dict) -> Config:
     gw = _table(data, "gateway")
-    public_url = _http_url(_str(gw, "public_url", "gateway"), "gateway.public_url")
+    public_url = _str(gw, "public_url", "gateway", "")
+    if public_url:
+        public_url = _http_url(public_url, "gateway.public_url")
     if urlsplit(public_url).path not in ("", "/"):
         raise ConfigError("gateway.public_url must not contain a path; mu-dsh serves from the root")
     gateway = GatewayConfig(

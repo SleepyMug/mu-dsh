@@ -87,6 +87,10 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(new=new), self.assertRaises(config_mod.ConfigError):
                 parse(CONFIG.replace(old, new))
 
+    def test_public_url_is_optional(self):
+        cfg = parse(CONFIG.replace('public_url = "http://gw.example:8080/"', ""))
+        self.assertEqual((cfg.gateway.public_url, cfg.public_host), ("", ""))
+
     def test_listen_ipv6(self):
         self.assertEqual(config_mod.Listen.parse("[::1]:80", "x"), config_mod.Listen("::1", 80))
 
@@ -393,6 +397,31 @@ class UserFilesTest(unittest.TestCase):
     def test_creates_dsh_home(self):
         self.provisioner.apply(self.account, "x", "k")
         self.assertTrue((self.dsh / ".env").exists())
+
+
+class SpecBuilderTest(unittest.TestCase):
+    class FakeHostNames:
+        def authorities(self):
+            return ["10.0.0.5", "gw"]
+
+    def build(self, cfg):
+        from control.dshinstall import DshInstaller
+
+        me = pwd.getpwuid(os.getuid())
+        account = Account("alice", me.pw_uid, me.pw_gid, (), "/home/alice", "/bin/bash")
+        builder = supervisor.SpecBuilder(DshInstaller(Path("/opt/dsh"), Path("/tmp")), self.FakeHostNames())
+        return builder.build(cfg, User("alice", 20000, "k"), account, "/usr/bin/node", "patch").argv
+
+    def test_public_url_sets_one_trusted_host(self):
+        argv = self.build(parse())
+        self.assertIn("--public-url", argv)
+        self.assertEqual(argv[argv.index("--trusted-host") + 1], "gw.example")
+        self.assertEqual(argv.count("--trusted-host"), 1)
+
+    def test_without_public_url_trusts_own_names(self):
+        argv = self.build(parse(CONFIG.replace('public_url = "http://gw.example:8080/"', "")))
+        self.assertNotIn("--public-url", argv)
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--trusted-host"], ["10.0.0.5", "gw"])
 
 
 class FakeProc:

@@ -23,6 +23,7 @@ from control.accounts import Account
 from control.changes import Changes
 from control.config import Config
 from control.dshinstall import DshInstaller
+from control.hostnames import HostNames
 from control.provision import Provisioner
 from control.users import User
 
@@ -50,10 +51,17 @@ class Spec:
 class SpecBuilder:
     """Turns configuration and a user into the command line their dsh runs with."""
 
-    def __init__(self, installer: DshInstaller):
+    def __init__(self, installer: DshInstaller, hostnames: HostNames):
         self.installer = installer
+        self.hostnames = hostnames
 
     def build(self, cfg: Config, user: User, account: Account, node: str, patch: str) -> Spec:
+        # dsh refuses requests whose Host is not loopback or a trusted host, so it must
+        # trust what browsers type: the public URL's host, or else any of our own names.
+        if cfg.gateway.public_url:
+            reach = ["--public-url", f"{cfg.gateway.public_url}/u/{user.name}/", "--trusted-host", cfg.public_host]
+        else:
+            reach = [arg for host in self.hostnames.authorities() for arg in ("--trusted-host", host)]
         argv = (
             node,
             str(self.installer.entry_script(cfg.dsh.version)),
@@ -61,8 +69,7 @@ class SpecBuilder:
             "--no-open",
             "--host", "127.0.0.1",
             "--port", str(user.port),
-            "--public-url", f"{cfg.gateway.public_url}/u/{user.name}/",
-            "--trusted-host", cfg.public_host,
+            *reach,
             *cfg.dsh.extra_args,
         )
         path = ":".join(dict.fromkeys([str(Path(node).parent), "/usr/local/bin", "/usr/bin", "/bin"]))
