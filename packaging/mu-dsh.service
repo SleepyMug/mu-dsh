@@ -1,0 +1,26 @@
+[Unit]
+Description=mu-dsh: multi-user DeepSeek Harness
+Documentation=file:///opt/mu-dsh/README.md
+After=network-online.target
+Wants=network-online.target mu-dsh-gateway.service
+
+[Service]
+Type=simple
+Environment=HOME=/root
+# Installs the pinned dsh version when it is missing; a no-op otherwise.
+ExecStartPre=/usr/local/bin/mu-dsh install-dsh
+ExecStart=/usr/local/bin/mu-dsh serve
+ExecReload=/bin/kill -HUP $MAINPID
+RuntimeDirectory=mu-dsh
+RuntimeDirectoryMode=0755
+# The first start downloads dsh from npm.
+TimeoutStartSec=15min
+# SIGTERM reaches only the daemon, which stops every user's dsh itself;
+# anything left after the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

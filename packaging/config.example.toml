@@ -1,0 +1,60 @@
+# mu-dsh configuration. After editing: sudo systemctl reload mu-dsh
+# (gateway listen-address changes restart the gateway automatically).
+
+[gateway]
+# Where browsers connect. Unlike dsh itself, the gateway may bind a wildcard address.
+listen = "0.0.0.0:8080"
+# The URL users type, without a path. Its host name is what dsh trusts as
+# the browser-visible authority, so it must match what users actually open.
+public_url = "http://gw.example.internal:8080"
+# Lifetime of a gateway sign-in.
+session_max_age_days = 30
+# Unix group the gateway runs as; it may read /run/mu-dsh/gateway.json.
+group = "mu-dsh"
+
+[relay]
+# Loopback endpoint every user's dsh sends model requests to.
+listen = "127.0.0.1:8401"
+
+[dsh]
+# Pinned @deepseek-ai/dsh version; mu-dsh installs it on start. Changing it
+# and restarting (systemctl restart mu-dsh) upgrades every user.
+version = "0.2.1-rc.5"
+# Optional npm registry mirror for the dsh install.
+npm_registry = ""
+# Each managed user gets the next free loopback port from here.
+port_base = 20000
+# Node.js binary for dsh; empty means `node` on PATH.
+node = ""
+# Extra arguments appended to every `dsh --profile web` command line.
+extra_args = []
+# Packages whose npm install scripts may run (npm >= 11.20 skips the rest).
+# The default covers dsh 0.2.1-rc.5; if `journalctl -u mu-dsh` shows npm
+# naming other packages after an upgrade, list them all here.
+# allow_install_scripts = ["@deepseek-ai/dsh-subprocess-local", "koffi", "node-pty", "protobufjs", "@google/genai"]
+
+[llm]
+# OpenAI-compatible inference service shared by everyone, and its real key.
+# Users never see this key: their dsh holds a per-user relay key instead.
+base_url = "https://llm.example.internal/v1"
+api_key = "sk-replace-me"
+# Wire protocol: openai-completions, openai-responses, or anthropic-messages.
+api = "openai-completions"
+# dsh provider id and the label its model picker shows.
+provider_id = "mu-dsh"
+display_name = "Company LLM"
+default_model = "my-model"
+
+# Optional pi-ai compatibility switches for endpoints it cannot auto-detect,
+# for example a DeepSeek- or Qwen-style reasoning format on vLLM/SGLang:
+# [llm.compat]
+# thinkingFormat = "deepseek"
+
+# One table per model the service offers. Keys: id (required), name,
+# context_window, max_tokens, input (["text"] or ["text", "image"]),
+# reasoning_efforts. Other keys are passed to dsh unchanged.
+[[llm.models]]
+id = "my-model"
+name = "My Model"
+context_window = 131072
+max_tokens = 16384
