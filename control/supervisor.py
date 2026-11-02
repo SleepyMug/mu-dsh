@@ -14,24 +14,31 @@ import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
+from control import dshenv, managed
 from control.accounts import Account
 from control.changes import Changes
 from control.config import Config
 from control.dshinstall import DshInstaller
 from control.hostnames import HostNames
-from control.provision import Provisioner
+from control.provision import Provision, Provisioner
+from control.sitelayers import Layers
 from control.users import User
 
 log = logging.getLogger("mu-dsh.supervisor")
 
 URL_LINE = re.compile(r"dsh web:\s*(\S+)")
 TOKEN_IN_TEXT = re.compile(r"token=[A-Za-z0-9_-]+")
+STACK_FRAME = re.compile(r"^\s+at ")
+ERROR_LINE = re.compile(r"^\w*(Error|Exception)\b.*:")
 
+OUTPUT_KEPT = 40  # recent output lines kept to explain an exit
+ERROR_LINES = 12  # at most this many shown to the user
 STOP_TIMEOUT = 10.0
 MAX_BACKOFF = 30.0
 HEALTHY_AFTER = 60.0
@@ -41,11 +48,17 @@ HEALTHY_AFTER = 60.0
 class Spec:
     """Everything that determines how one user's dsh runs. A changed spec restarts the process."""
 
-    account: Account
+    provision: Provision
     argv: tuple[str, ...]
-    env: tuple[tuple[str, str], ...]
-    patch: str
-    llm_key: str
+    layers: str  # digest of the shared defaults, so changing them restarts every user
+
+    @property
+    def account(self) -> Account:
+        return self.provision.account
+
+    @property
+    def env(self) -> tuple[tuple[str, str], ...]:
+        return self.provision.env
 
 
 class SpecBuilder:
@@ -55,17 +68,17 @@ class SpecBuilder:
         self.installer = installer
         self.hostnames = hostnames
 
-    def build(self, cfg: Config, user: User, account: Account, node: str, patch: str) -> Spec:
+    def build(self, cfg: Config, user: User, account: Account, node: str, layers: Layers) -> Spec:
         # dsh refuses requests whose Host is not loopback or a trusted host, so it must
         # trust what browsers type: the public URL's host, or else any of our own names.
         if cfg.gateway.public_url:
             reach = ["--public-url", f"{cfg.gateway.public_url}/u/{user.name}/", "--trusted-host", cfg.public_host]
         else:
             reach = [arg for host in self.hostnames.authorities() for arg in ("--trusted-host", host)]
+        dsh = (node, str(self.installer.entry_script(cfg.dsh.version)))
         argv = (
-            node,
-            str(self.installer.entry_script(cfg.dsh.version)),
-            "--profile", "web",
+            *dsh,
+            "--profile", managed.PROFILE,
             "--no-open",
             "--host", "127.0.0.1",
             "--port", str(user.port),
@@ -73,9 +86,16 @@ class SpecBuilder:
             *cfg.dsh.extra_args,
         )
         path = ":".join(dict.fromkeys([str(Path(node).parent), "/usr/local/bin", "/usr/bin", "/bin"]))
-        env = account.base_env(path)
-        env["DSH_HOME"] = account.dsh_home
-        return Spec(account=account, argv=argv, env=tuple(sorted(env.items())), patch=patch, llm_key=user.llm_key)
+        file_env, launch_env = dshenv.split(cfg.dsh.env)
+        env = {**dict(launch_env), **account.base_env(path), "DSH_HOME": account.dsh_home}
+        provision = Provision(
+            account=account,
+            env_block=managed.env_block(user.llm_key, file_env),
+            home_patch=managed.policy_text(),
+            dsh=dsh,
+            env=tuple(sorted(env.items())),
+        )
+        return Spec(provision=provision, argv=argv, layers=layers.digest)
 
 
 def token_from_line(line: str) -> str | None:
@@ -93,7 +113,7 @@ class Launcher:
         self.provisioner = provisioner
 
     def start(self, spec: Spec) -> subprocess.Popen:
-        self.provisioner.apply(spec.account, spec.patch, spec.llm_key)
+        self.provisioner.apply(spec.provision)
         return subprocess.Popen(
             list(spec.argv),
             env=dict(spec.env),
@@ -135,6 +155,7 @@ class Instance:
     failures: int = 0
     next_start: float = 0.0
     last_error: str | None = None
+    output: deque = field(default_factory=lambda: deque(maxlen=OUTPUT_KEPT), repr=False)
     reader: threading.Thread | None = field(default=None, repr=False)
 
     @property
@@ -185,6 +206,11 @@ class Supervisor:
                 inst.failures = 0 if ran >= HEALTHY_AFTER else inst.failures + 1
                 delay = 0.0 if inst.failures == 0 else _backoff(inst.failures)
                 inst.last_error = f"exited with status {proc.returncode} after {ran:.0f}s"
+                if inst.reader is not None:
+                    inst.reader.join(timeout=1)  # let it collect the last lines
+                explanation = error_summary(list(inst.output))
+                if explanation:
+                    inst.last_error += ":\n" + explanation
                 log.warning("%s's dsh %s; restarting in %.0fs", inst.name, inst.last_error, delay)
                 with self.lock:
                     inst.proc = None
@@ -224,6 +250,7 @@ class Supervisor:
             inst.proc = proc
             inst.token = None
             inst.started_at = self.clock()
+            inst.output.clear()
         inst.reader = threading.Thread(target=self._read_output, args=(inst, proc), daemon=True, name=f"dsh-{inst.name}")
         inst.reader.start()
 
@@ -239,13 +266,25 @@ class Supervisor:
                         inst.token = token
                         inst.last_error = None
                 self.changes.mark()
-            log.info("[%s] %s", inst.name, TOKEN_IN_TEXT.sub("token=<redacted>", line))
+            line = TOKEN_IN_TEXT.sub("token=<redacted>", line)
+            inst.output.append(line)
+            log.info("[%s] %s", inst.name, line)
 
     def _stop(self, inst: Instance) -> None:
         with self.lock:
             proc, inst.proc, inst.token = inst.proc, None, None
         if proc is not None:
             self.launcher.stop([proc])
+
+
+def error_summary(lines: list[str]) -> str:
+    """The part of a dead process's output that explains it: from its last
+    error line on, without stack frames; else its last few lines."""
+    lines = [l for l in lines if l.strip() and not STACK_FRAME.match(l)]
+    starts = [i for i, l in enumerate(lines) if ERROR_LINE.match(l)]
+    if starts:
+        lines = lines[starts[-1]:]
+    return "\n".join(lines[:ERROR_LINES] if starts else lines[-ERROR_LINES:])
 
 
 def _backoff(failures: int) -> float:

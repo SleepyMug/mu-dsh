@@ -20,6 +20,7 @@ from control.pam import PamAuthenticator
 from control.paths import Paths
 from control.pidfile import PidFile
 from control.provision import Provisioner
+from control.sitelayers import SiteLayers
 from control.state import SessionSecret, StateFile
 from control.supervisor import Launcher, SpecBuilder, Supervisor
 from control.users import UserStore
@@ -67,6 +68,7 @@ def build_daemon(services: Services) -> Daemon:
         users=services.users,
         accounts=services.accounts,
         installer=services.installer,
+        site_layers=SiteLayers(services.paths.dsh_root),
         specs=SpecBuilder(services.installer, HostNames()),
         supervisor=Supervisor(Launcher(services.provisioner), changes),
         changes=changes,

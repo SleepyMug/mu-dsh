@@ -10,13 +10,14 @@ from __future__ import annotations
 import logging
 import signal
 
-from control import managed, state
+from control import state
 from control.accounts import AccountError, Accounts
 from control.authserver import AuthServer
 from control.changes import Changes
 from control.config import Config, ConfigError, ConfigFile
 from control.dshinstall import DshInstaller, InstallError, find_node
 from control.pidfile import PidFile
+from control.sitelayers import Layers, SiteLayers
 from control.state import SessionSecret, StateFile
 from control.supervisor import Spec, SpecBuilder, Supervisor
 from control.users import User, UserStore
@@ -32,6 +33,7 @@ class Daemon:
         users: UserStore,
         accounts: Accounts,
         installer: DshInstaller,
+        site_layers: SiteLayers,
         specs: SpecBuilder,
         supervisor: Supervisor,
         changes: Changes,
@@ -44,6 +46,7 @@ class Daemon:
         self.users = users
         self.accounts = accounts
         self.installer = installer
+        self.site_layers = site_layers
         self.specs = specs
         self.supervisor = supervisor
         self.changes = changes
@@ -95,7 +98,8 @@ class Daemon:
         if not self.installer.is_installed(cfg.dsh.version):
             raise InstallError(f"dsh {cfg.dsh.version} is not installed; run `mu-dsh install-dsh`")
         users = self.users.load()
-        desired = self._desired_specs(cfg, users, node)
+        layers = self.site_layers.write(cfg)
+        desired = self._desired_specs(cfg, users, node, layers)
         self.cfg, self.current_users = cfg, users
         # Publish first so the gateway stops admitting removed or disabled users
         # before their processes are stopped.
@@ -111,8 +115,7 @@ class Daemon:
         )
         self.state_file.write(payload, self.cfg.gateway.group)
 
-    def _desired_specs(self, cfg: Config, users: dict[str, User], node: str) -> dict[str, Spec]:
-        patch = managed.patch_text(cfg)
+    def _desired_specs(self, cfg: Config, users: dict[str, User], node: str, layers: Layers) -> dict[str, Spec]:
         desired: dict[str, Spec] = {}
         for name, user in users.items():
             if not user.enabled:
@@ -122,7 +125,7 @@ class Daemon:
             except AccountError as e:
                 log.error("skipping managed user %s: %s", name, e)
                 continue
-            desired[name] = self.specs.build(cfg, user, account, node, patch)
+            desired[name] = self.specs.build(cfg, user, account, node, layers)
         return desired
 
     def _on_signal(self, signum, _frame) -> None:

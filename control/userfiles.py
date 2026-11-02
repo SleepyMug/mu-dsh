@@ -5,10 +5,17 @@ uid/gid and ``python3 -I``), so it never follows a user-controlled symlink
 with root privileges. It imports nothing from the control package; the
 caller sends everything it needs as JSON on stdin:
 
-    {"dsh_home": "...", "env_block": "...", "patch": "...",
-     "patch_marker": "...", "env_begin": "...", "env_end": "..."}
+    {"dsh_home": "...", "env_block": "...", "env_begin": "...", "env_end": "...",
+     "home_patch": "...", "patch_marker": "...",
+     "bundle": "mu-dsh-defaults", "base_bundle": "@deepseek-ai/dsh-base"}
+
+It puts the managed block at the top of ~/.dsh/.env, writes the home-level
+patch (keeping one backup of a file the user wrote there), and lists the
+defaults bundle in every profile built on dsh's base bundle, right after
+dsh's own bundles.
 """
 
+import glob
 import json
 import os
 import sys
@@ -47,25 +54,51 @@ def strip_block(text, begin, end):
     return result
 
 
+def write_env(home, req):
+    path = os.path.join(home, ".env")
+    user_env = strip_block(read(path) or "", req["env_begin"], req["env_end"]).lstrip("\n")
+    text = req["env_block"] + ("\n" + user_env if user_env else "")
+    if read(path) != text:
+        atomic_write(path, text, 0o600)
+
+
+def write_home_patch(home, req):
+    path = os.path.join(home, "cordis.patch.yml")
+    existing = read(path)
+    if existing is not None and not existing.startswith(req["patch_marker"]):
+        backup = path + ".pre-mu-dsh"
+        if not os.path.lexists(backup):
+            atomic_write(backup, existing, 0o600)
+    if existing != req["home_patch"]:
+        atomic_write(path, req["home_patch"], 0o600)
+
+
+def list_bundle(path, req):
+    try:
+        manifest = json.loads(read(path) or "")
+        profile = manifest["dsh"]["profile"]
+    except (ValueError, KeyError, TypeError):
+        return  # not a profile dsh can load anyway; leave it to the user
+    if req["base_bundle"] not in profile.get("bundles", []):
+        return
+    bundles = [b for b in profile["bundles"] if b != req["bundle"]]
+    # Directly above dsh's own bundles, below any the user installed.
+    shipped = [i for i, b in enumerate(bundles) if b.startswith("@deepseek-ai/")]
+    bundles.insert(shipped[-1] + 1 if shipped else 0, req["bundle"])
+    if profile.get("bundles") != bundles:
+        profile["bundles"] = bundles
+        atomic_write(path, json.dumps(manifest, indent=2) + "\n", 0o644)
+
+
 def main():
     req = json.load(sys.stdin)
     home = req["dsh_home"]
-    env_path = os.path.join(home, ".env")
-    patch_path = os.path.join(home, "cordis.patch.yml")
-    env_text = read(env_path)
-    user_env = strip_block(env_text or "", req["env_begin"], req["env_end"])
-    patch_existing = read(patch_path)
-
     os.makedirs(home, mode=0o700, exist_ok=True)
     os.chmod(home, 0o700)
-    sep = "\n" if user_env and not user_env.endswith("\n\n") else ""
-    atomic_write(env_path, user_env + sep + req["env_block"], 0o600)
-    if patch_existing is not None and not patch_existing.startswith(req["patch_marker"]):
-        backup = patch_path + ".pre-mu-dsh"
-        if not os.path.exists(backup):
-            atomic_write(backup, patch_existing, 0o600)
-    if patch_existing != req["patch"]:
-        atomic_write(patch_path, req["patch"], 0o600)
+    write_env(home, req)
+    write_home_patch(home, req)
+    for manifest in sorted(glob.glob(os.path.join(glob.escape(home), "profiles", "*", "package.json"))):
+        list_bundle(manifest, req)
 
 
 if __name__ == "__main__":

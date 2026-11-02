@@ -27,6 +27,8 @@ ${head}
           border-radius: 6px; color: inherit; text-decoration: none; font-weight: 600; }
   nav a.primary { background: #3657d6; border-color: #3657d6; color: #fff; }
   .muted { color: #5b6270; }
+  pre.problem { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: #f4f5f7;
+                padding: .6rem; border-radius: 6px; max-height: 18rem; overflow: auto; }
 </style>
 </head>
 <body><main>${body}</main></body>
@@ -51,7 +53,11 @@ ${next}<label for="username">User name</label>
 }
 
 export function startingPage(user: string, error: string | null): string {
-  const detail = error ? `<p class="muted">Last problem: ${escapeHtml(error)}</p>` : ''
+  const detail = error
+    ? `<p class="muted">It stopped last time. If the problem is in your own configuration, fix it from a shell
+(for example <code>~/.dsh/profiles/web/cordis.patch.yml</code>); dsh is retried automatically.</p>
+<pre class="problem">${escapeHtml(error)}</pre>`
+    : ''
   return layout(
     'Starting · DeepSeek Harness',
     `<h1>Starting your workspace…</h1>

@@ -1,10 +1,11 @@
-"""Write mu-dsh's managed files into a user's ~/.dsh, as that user."""
+"""Prepare a user's ~/.dsh before their dsh starts, as that user."""
 
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from control import managed
@@ -17,32 +18,53 @@ class ProvisionError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class Provision:
+    account: Account
+    env_block: str
+    home_patch: str
+    dsh: tuple[str, ...]  # node and dsh's entry script
+    env: tuple[tuple[str, str], ...]
+
+
 class Provisioner:
-    """Runs userfiles.py with the target account's credentials, so root never
-    writes through a path the user controls."""
+    """Runs dsh and userfiles.py with the target account's credentials, so root
+    never writes through a path the user controls."""
 
     def __init__(self, python: str = sys.executable, helper: Path = HELPER):
         self.python = python
         self.helper = helper
 
-    def apply(self, account: Account, patch_text: str, llm_key: str) -> None:
+    def apply(self, p: Provision) -> None:
+        for profile in managed.PROFILES:
+            if not Path(p.account.dsh_home, "profiles", profile, "package.json").exists():
+                # Let dsh create the profile from its own template; this only composes, it starts nothing.
+                argv = [*p.dsh, "--profile", profile, "--dump-default-config"]
+                self._run(p, argv, None, f"creating the dsh profile {profile}")
         request = {
-            "patch": patch_text,
-            "env_block": managed.env_block(llm_key),
-            "dsh_home": account.dsh_home,
-            "patch_marker": managed.PATCH_MARKER,
+            "dsh_home": p.account.dsh_home,
+            "env_block": p.env_block,
             "env_begin": managed.ENV_BEGIN,
             "env_end": managed.ENV_END,
+            "home_patch": p.home_patch,
+            "patch_marker": managed.PATCH_MARKER,
+            "bundle": managed.DEFAULTS_BUNDLE,
+            "base_bundle": managed.BASE_BUNDLE,
         }
+        self._run(p, [self.python, "-I", str(self.helper)], json.dumps(request), "provisioning")
+
+    def _run(self, p: Provision, argv: list[str], stdin: str | None, what: str) -> None:
         proc = subprocess.run(
-            [self.python, "-I", str(self.helper)],
-            input=json.dumps(request),
+            argv,
+            input=stdin,
             capture_output=True,
             text=True,
-            cwd=account.home,
-            env=account.base_env("/usr/bin:/bin"),
-            timeout=30,
-            **account.popen_kwargs(),
+            cwd=p.account.home,
+            env=dict(p.env),
+            timeout=120,
+            **p.account.popen_kwargs(),
         )
         if proc.returncode != 0:
-            raise ProvisionError(f"provisioning {account.name} failed: {proc.stderr.strip() or proc.returncode}")
+            output = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
+            raise ProvisionError(f"{what} for {p.account.name} failed: {' / '.join(output) or proc.returncode}")
+

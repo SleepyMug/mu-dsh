@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from control import dshenv
+
 
 class ConfigError(Exception):
     pass
@@ -56,6 +58,7 @@ class DshConfig:
     node: str  # empty: find on PATH
     extra_args: tuple[str, ...]
     allow_scripts: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()  # [dsh.env], in file order
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,28 @@ def _http_url(value: str, where: str) -> str:
     return value.rstrip("/")
 
 
+def _env(table: dict) -> tuple[tuple[str, str], ...]:
+    raw = table.get("env", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("[dsh.env] must be a table of NAME = \"value\"")
+    env = []
+    for name, value in raw.items():
+        where = f"dsh.env.{name}"
+        if not dshenv.NAME.fullmatch(name):
+            raise ConfigError(f"{where}: not a valid environment variable name")
+        if name.upper() in dshenv.RESERVED:
+            raise ConfigError(f"{where}: mu-dsh sets this variable itself")
+        if not isinstance(value, str):
+            raise ConfigError(f"{where} must be a string")
+        if "\n" in value or "\0" in value:
+            raise ConfigError(f"{where} must be a single line")
+        if "'" in value and not dshenv.launch_only(name):
+            # Written to ~/.dsh/.env single-quoted, which has no escapes.
+            raise ConfigError(f"{where} must not contain a single quote")
+        env.append((name, value))
+    return tuple(env)
+
+
 def _model(raw: object, index: int) -> dict:
     where = f"llm.models[{index}]"
     if not isinstance(raw, dict):
@@ -171,6 +196,7 @@ def parse(data: dict) -> Config:
         node=_str(d, "node", "dsh", ""),
         extra_args=_str_list(d, "extra_args", "dsh", []),
         allow_scripts=_str_list(d, "allow_install_scripts", "dsh", DEFAULT_ALLOW_SCRIPTS),
+        env=_env(d),
     )
     if not 1024 <= dsh.port_base <= 65000:
         raise ConfigError("dsh.port_base must be between 1024 and 65000")

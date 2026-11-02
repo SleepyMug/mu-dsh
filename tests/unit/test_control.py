@@ -17,12 +17,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from control import config as config_mod  # noqa: E402
-from control import managed, state, supervisor  # noqa: E402
+from control import dshenv, managed, state, supervisor  # noqa: E402
 from control.accounts import Account, AccountError, Accounts  # noqa: E402
 from control.admin import UserAdmin  # noqa: E402
 from control.authserver import AuthServer  # noqa: E402
 from control.changes import Changes  # noqa: E402
-from control.provision import Provisioner  # noqa: E402
+from control.provision import Provision, Provisioner  # noqa: E402
+from control.sitelayers import Layers, SiteLayers  # noqa: E402
 from control.state import SessionSecret, StateFile  # noqa: E402
 from control.users import User, UserError, UserStore, allocate_port  # noqa: E402
 
@@ -37,6 +38,12 @@ CONFIG = textwrap.dedent(
 
     [dsh]
     version = "0.2.1-rc.5"
+
+    [dsh.env]
+    HTTPS_PROXY = "http://proxy.example:3128"
+    no_proxy = "llm.example,.corp.example"
+    NODE_EXTRA_CA_CERTS = "/etc/ssl/corp.pem"
+    PIP_INDEX_URL = "https://pypi.corp.example/simple"
 
     [llm]
     base_url = "https://llm.example/v1"
@@ -91,21 +98,55 @@ class ConfigTest(unittest.TestCase):
         cfg = parse(CONFIG.replace('public_url = "http://gw.example:8080/"', ""))
         self.assertEqual((cfg.gateway.public_url, cfg.public_host), ("", ""))
 
+    def test_dsh_env(self):
+        cfg = parse()
+        self.assertEqual(cfg.dsh.env[0], ("HTTPS_PROXY", "http://proxy.example:3128"))
+        file_env, launch_env = dshenv.split(cfg.dsh.env)
+        self.assertEqual([k for k, _ in file_env], ["HTTPS_PROXY", "no_proxy", "PIP_INDEX_URL"])
+        self.assertEqual(launch_env, (("NODE_EXTRA_CA_CERTS", "/etc/ssl/corp.pem"),))
+        self.assertEqual(parse(CONFIG.replace("[dsh.env]", "[dsh.unused]")).dsh.env, ())
+
+    def test_dsh_env_errors(self):
+        for line, message in [
+            ('HOME = "/x"', "sets this variable itself"),
+            ('MUDSH_LLM_KEY = "x"', "sets this variable itself"),
+            ('"BAD-NAME" = "x"', "not a valid"),
+            ("FOO = 1", "must be a string"),
+            ('FOO = "a\\nb"', "single line"),
+            ("FOO = \"it's\"", "single quote"),
+        ]:
+            with self.subTest(line=line), self.assertRaisesRegex(config_mod.ConfigError, message):
+                parse(CONFIG.replace("[dsh.env]\n", f"[dsh.env]\n{line}\n"))
+        # Launch-only variables never go to .env, so quotes are fine there.
+        parse(CONFIG.replace("[dsh.env]\n", "[dsh.env]\nNODE_OPTIONS = \"--title='x'\"\n"))
+
     def test_listen_ipv6(self):
         self.assertEqual(config_mod.Listen.parse("[::1]:80", "x"), config_mod.Listen("::1", 80))
 
 
 class ManagedTest(unittest.TestCase):
-    def test_patch_is_valid_yaml_for_node(self):
-        """dsh parses the patch with js-yaml; the emitted YAML must round-trip through a real parser."""
-        text = managed.patch_text(parse())
-        self.assertTrue(text.startswith(managed.PATCH_MARKER))
-        parsed = parse_yaml(text)
-        self.assertEqual(parsed, managed.patch_entries(parse()))
+    def test_layers_are_valid_yaml_for_node(self):
+        """dsh parses patches with js-yaml; the emitted YAML must round-trip through a real parser."""
+        parsed = parse_yaml(managed.defaults_text(parse()))
+        self.assertEqual(parsed, managed.defaults_entries(parse()))
         provider = parsed[0]["config"]["providers"]["mu-dsh"]
         self.assertEqual(provider["baseURL"], "http://127.0.0.1:8401/v1")
         self.assertEqual(provider["apiKeyEnv"], "MUDSH_LLM_KEY")
         self.assertEqual(provider["compat"], {"thinkingFormat": "qwen"})
+        self.assertEqual(parsed[1]["config"], {"provider": "mu-dsh", "model": "big"})
+        self.assertEqual(parse_yaml(managed.policy_text()), managed.policy_entries())
+        bundle = json.loads(managed.bundle_manifest())
+        self.assertEqual(bundle["dsh"], {"bundle": {"patch": "cordis.patch.yml"}})
+
+    @unittest.skipUnless(shutil.which("node"), "needs node")
+    def test_env_block_parses_like_node(self):
+        env = (("HTTPS_PROXY", "http://u:p@proxy:3128"), ("X", 'a "b" #c $D'))
+        block = managed.env_block("mudsh-k", env)
+        out = subprocess.run(
+            ["node", "-e", "process.stdout.write(JSON.stringify(require('node:util').parseEnv(require('fs').readFileSync(0,'utf8'))))"],
+            input=block, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(json.loads(out), {"MUDSH_LLM_KEY": "mudsh-k", **dict(env)})
 
     def test_yaml_quoting(self):
         value = [{"a: b": "x\n\"y\"", "n": None, "t": True, "e": [], "d": {}, "l": [1, "two", {"k": "v"}]}]
@@ -361,6 +402,15 @@ class AuthServerTest(unittest.TestCase):
                 self.assertEqual(self.ask(raw), {"ok": False})
 
 
+# Stands in for `dsh --profile <p> --dump-default-config`, which creates a profile from dsh's template.
+FAKE_DSH = (
+    sys.executable, "-c",
+    "import json, os, sys; p = sys.argv[2]; d = os.path.join(os.environ['DSH_HOME'], 'profiles', p);"
+    "os.makedirs(d); json.dump({'name': 'dsh-profile-' + p, 'dsh': {'profile': {'bundles':"
+    " ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-' + p]}}}, open(os.path.join(d, 'package.json'), 'w'))",
+)
+
+
 class UserFilesTest(unittest.TestCase):
     """Runs the real helper as the invoking user against a fake home."""
 
@@ -369,34 +419,111 @@ class UserFilesTest(unittest.TestCase):
         me = pwd.getpwuid(os.getuid())
         self.account = Account(me.pw_name, me.pw_uid, me.pw_gid, (me.pw_gid,), str(self.home), "/bin/sh")
         self.dsh = self.home / ".dsh"
+        self.manifest = self.dsh / "profiles" / "web" / "package.json"
         self.provisioner = Provisioner()
 
     def tearDown(self):
         shutil.rmtree(self.home)
 
-    def test_apply_is_idempotent_and_preserves_user_lines(self):
-        self.dsh.mkdir()
-        (self.dsh / ".env").write_text("MY_VAR=1\n")
-        (self.dsh / "cordis.patch.yml").write_text("- id: mine\n")
-        patch = managed.patch_text(parse())
-        self.provisioner.apply(self.account, patch, "mudsh-key1")
-        first = (self.dsh / ".env").read_text()
-        self.provisioner.apply(self.account, patch, "mudsh-key1")
-        self.assertEqual((self.dsh / ".env").read_text(), first)
-        self.assertIn("MY_VAR=1\n", first)
-        self.assertIn("MUDSH_LLM_KEY=mudsh-key1\n", first)
-        self.assertEqual((self.dsh / "cordis.patch.yml").read_text(), patch)
-        self.assertEqual((self.dsh / "cordis.patch.yml.pre-mu-dsh").read_text(), "- id: mine\n")
+    def apply(self, key="mudsh-key1", env=(("HTTPS_PROXY", "http://proxy:3128"),)):
+        self.provisioner.apply(Provision(
+            account=self.account,
+            env_block=managed.env_block(key, env),
+            home_patch=managed.policy_text(),
+            dsh=FAKE_DSH,
+            env=(("DSH_HOME", str(self.dsh)), ("PATH", "/usr/bin:/bin")),
+        ))
+
+    def bundles(self, profile="web"):
+        manifest = self.dsh / "profiles" / profile / "package.json"
+        return json.loads(manifest.read_text())["dsh"]["profile"]["bundles"]
+
+    def test_creates_profiles_and_lists_bundle(self):
+        self.apply()
+        self.assertEqual(self.bundles("web"), ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web", "mu-dsh-defaults"])
+        self.assertEqual(self.bundles("headless"), ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "mu-dsh-defaults"])
         self.assertEqual(oct(os.stat(self.dsh).st_mode & 0o777), "0o700")
 
-        self.provisioner.apply(self.account, patch, "mudsh-key2")
+    def test_profiles_without_base_are_left_alone(self):
+        minimal = self.dsh / "profiles" / "sdk-minimal"
+        minimal.mkdir(parents=True)
+        text = json.dumps({"dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-sdk-minimal"]}}})
+        (minimal / "package.json").write_text(text)
+        (self.dsh / "profiles" / "broken").mkdir()
+        (self.dsh / "profiles" / "broken" / "package.json").write_text("{not json")
+        self.apply()
+        self.assertEqual((minimal / "package.json").read_text(), text)
+        self.assertEqual((self.dsh / "profiles" / "broken" / "package.json").read_text(), "{not json")
+
+    def test_bundle_goes_below_the_users_own_bundles(self):
+        self.apply()
+        manifest = json.loads(self.manifest.read_text())
+        manifest["dsh"]["profile"]["bundles"] = ["@deepseek-ai/dsh-base", "mu-dsh-defaults", "@deepseek-ai/dsh-web", "my-bundle"]
+        manifest["dependencies"] = {"my-bundle": "1.0.0"}
+        self.manifest.write_text(json.dumps(manifest))
+        self.apply()
+        self.assertEqual(self.bundles(), ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web", "mu-dsh-defaults", "my-bundle"])
+        self.assertEqual(json.loads(self.manifest.read_text())["dependencies"], {"my-bundle": "1.0.0"})
+
+    def test_env_block_on_top_keeps_user_lines(self):
+        self.dsh.mkdir()
+        (self.dsh / ".env").write_text("MY_VAR=1\nHTTPS_PROXY=http://mine:8080\n")
+        self.apply()
+        first = (self.dsh / ".env").read_text()
+        self.assertTrue(first.startswith(managed.ENV_BEGIN))
+        self.assertTrue(first.endswith("MY_VAR=1\nHTTPS_PROXY=http://mine:8080\n"), "user lines must follow, so they win")
+        self.assertIn("HTTPS_PROXY='http://proxy:3128'\n", first)
+        self.apply()
+        self.assertEqual((self.dsh / ".env").read_text(), first)
+        self.apply(key="mudsh-key2", env=())
         env = (self.dsh / ".env").read_text()
         self.assertNotIn("key1", env)
+        self.assertNotIn("proxy:3128", env)
         self.assertEqual(env.count(managed.ENV_BEGIN), 1)
 
-    def test_creates_dsh_home(self):
-        self.provisioner.apply(self.account, "x", "k")
-        self.assertTrue((self.dsh / ".env").exists())
+    def test_old_block_at_the_end_moves_to_the_top(self):
+        self.dsh.mkdir()
+        (self.dsh / ".env").write_text(f"MY_VAR=1\n\n{managed.ENV_BEGIN}\nMUDSH_LLM_KEY=old\n{managed.ENV_END}\n")
+        self.apply()
+        env = (self.dsh / ".env").read_text()
+        self.assertTrue(env.startswith(managed.ENV_BEGIN))
+        self.assertIn("MY_VAR=1", env)
+        self.assertNotIn("=old", env)
+
+    def test_home_patch_is_policy_and_backs_up_the_users_file_once(self):
+        self.dsh.mkdir()
+        home_patch = self.dsh / "cordis.patch.yml"
+        home_patch.write_text("- id: mine\n")
+        self.apply()
+        self.assertEqual(home_patch.read_text(), managed.policy_text())
+        self.assertEqual((self.dsh / "cordis.patch.yml.pre-mu-dsh").read_text(), "- id: mine\n")
+        home_patch.write_text("- id: mine-again\n")
+        self.apply()
+        self.assertEqual(home_patch.read_text(), managed.policy_text())
+        self.assertEqual((self.dsh / "cordis.patch.yml.pre-mu-dsh").read_text(), "- id: mine\n")
+
+
+class SiteLayersTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()) / "dsh"
+        self.root.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.root.parent)
+
+    def test_writes_bundle(self):
+        SiteLayers(self.root).write(parse())
+        bundle = self.root / "node_modules" / "mu-dsh-defaults"
+        self.assertEqual(json.loads((bundle / "package.json").read_text())["name"], "mu-dsh-defaults")
+        self.assertEqual((bundle / "cordis.patch.yml").read_text(), managed.defaults_text(parse()))
+        for path in (self.root, bundle.parent, bundle, bundle / "package.json", bundle / "cordis.patch.yml"):
+            self.assertTrue(os.stat(path).st_mode & 0o004, f"{path} must be world-readable")
+
+    def test_digest_follows_content(self):
+        sites = SiteLayers(self.root)
+        first = sites.write(parse()).digest
+        self.assertEqual(sites.write(parse()).digest, first)
+        self.assertNotEqual(sites.write(parse(CONFIG.replace('default_model = "big"', 'default_model = "small"'))).digest, first)
 
 
 class SpecBuilderTest(unittest.TestCase):
@@ -410,16 +537,33 @@ class SpecBuilderTest(unittest.TestCase):
         me = pwd.getpwuid(os.getuid())
         account = Account("alice", me.pw_uid, me.pw_gid, (), "/home/alice", "/bin/bash")
         builder = supervisor.SpecBuilder(DshInstaller(Path("/opt/dsh"), Path("/tmp")), self.FakeHostNames())
-        return builder.build(cfg, User("alice", 20000, "k"), account, "/usr/bin/node", "patch").argv
+        return builder.build(cfg, User("alice", 20000, "k"), account, "/usr/bin/node", Layers(digest="d"))
+
+    def test_runs_the_web_profile_with_policy_in_the_home_patch(self):
+        spec = self.build(parse())
+        self.assertEqual(spec.argv[2:4], ("--profile", "web"))
+        self.assertNotIn("--patch", spec.argv)
+        self.assertEqual(spec.provision.home_patch, managed.policy_text())
+        self.assertEqual(spec.provision.dsh, spec.argv[:2])
+
+    def test_env_goes_to_dotenv_or_launch_environment(self):
+        spec = self.build(parse())
+        env = dict(spec.env)
+        self.assertEqual(env["NODE_EXTRA_CA_CERTS"], "/etc/ssl/corp.pem")
+        self.assertEqual(env["DSH_HOME"], "/home/alice/.dsh")
+        self.assertNotIn("HTTPS_PROXY", env)
+        self.assertIn("HTTPS_PROXY='http://proxy.example:3128'", spec.provision.env_block)
+        self.assertIn("MUDSH_LLM_KEY=k\n", spec.provision.env_block)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", spec.provision.env_block)
 
     def test_public_url_sets_one_trusted_host(self):
-        argv = self.build(parse())
+        argv = self.build(parse()).argv
         self.assertIn("--public-url", argv)
         self.assertEqual(argv[argv.index("--trusted-host") + 1], "gw.example")
         self.assertEqual(argv.count("--trusted-host"), 1)
 
     def test_without_public_url_trusts_own_names(self):
-        argv = self.build(parse(CONFIG.replace('public_url = "http://gw.example:8080/"', "")))
+        argv = self.build(parse(CONFIG.replace('public_url = "http://gw.example:8080/"', ""))).argv
         self.assertNotIn("--public-url", argv)
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--trusted-host"], ["10.0.0.5", "gw"])
 
@@ -429,11 +573,13 @@ class FakeProc:
 
     _next_pid = 1000
 
-    def __init__(self, token: str):
+    def __init__(self, token: str, lines: list[str] | None = None):
         FakeProc._next_pid += 1
         self.pid = FakeProc._next_pid
         self.returncode = None
-        self.stdout = [f"dsh web: http://gw/u/alice/?token={token}\n".encode()]
+        if lines is None:
+            lines = [f"dsh web: http://gw/u/alice/?token={token}"]
+        self.stdout = [f"{line}\n".encode() for line in lines]
 
     def poll(self):
         return self.returncode
@@ -444,12 +590,13 @@ class FakeLauncher:
         self.started: list[FakeProc] = []
         self.stopped: list[FakeProc] = []
         self.fail_next = False
+        self.output: list[str] | None = None
 
     def start(self, spec):
         if self.fail_next:
             self.fail_next = False
             raise OSError("exec failed")
-        proc = FakeProc(token=f"tok{len(self.started)}")
+        proc = FakeProc(token=f"tok{len(self.started)}", lines=self.output)
         self.started.append(proc)
         return proc
 
@@ -469,7 +616,8 @@ class SupervisorTest(unittest.TestCase):
         self.account = Account("alice", me.pw_uid, me.pw_gid, (), "/tmp", "/bin/sh")
 
     def spec(self, key: str = "k") -> supervisor.Spec:
-        return supervisor.Spec(account=self.account, argv=("dsh",), env=(), patch="", llm_key=key)
+        provision = Provision(account=self.account, env_block=managed.env_block(key), home_patch="", dsh=(), env=())
+        return supervisor.Spec(provision=provision, argv=("dsh",), layers="d")
 
     def settle(self) -> None:
         for inst in self.sup.instances.values():
@@ -507,6 +655,29 @@ class SupervisorTest(unittest.TestCase):
             self.settle()
             self.assertEqual(len(self.launcher.started), started + 1)
         self.assertEqual(self.sup.snapshot()["alice"], {"up": True, "token": "tok3", "error": None})
+
+    def test_crash_reports_dsh_error(self):
+        self.launcher.output = [
+            "file:///opt/dsh/lib/index.js:3998",
+            "Error: dsh: failed to parse overlay /home/alice/.dsh/profiles/web/cordis.patch.yml: YAMLException: bad",
+            " 2 |   config: [oops",
+            "    at parsePatchList (file:///opt/dsh/lib/index.js:3998:9)",
+            "",
+            "Node.js v26.13.0",
+        ]
+        self.sup.apply({"alice": self.spec()})
+        self.sup.tick()
+        self.launcher.started[-1].returncode = 1
+        self.now += 1
+        self.sup.tick()
+        error = self.sup.snapshot()["alice"]["error"]
+        self.assertTrue(error.startswith("exited with status 1 after 1s:\nError: dsh: failed to parse overlay"), error)
+        self.assertIn("config: [oops", error)
+        self.assertNotIn("parsePatchList", error)
+
+    def test_error_summary_without_error_line_keeps_the_tail(self):
+        lines = [f"line {i}" for i in range(30)]
+        self.assertEqual(supervisor.error_summary(lines).splitlines(), lines[-supervisor.ERROR_LINES:])
 
     def test_exec_failure_backs_off(self):
         self.launcher.fail_next = True

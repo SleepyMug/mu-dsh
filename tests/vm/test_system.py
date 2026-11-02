@@ -40,6 +40,12 @@ listen = "127.0.0.1:8401"
 version = "{dsh_version}"
 port_base = 20000
 
+[dsh.env]
+# Unreachable on purpose: dsh never proxies loopback, so model calls via the relay still work.
+HTTPS_PROXY = "http://proxy.invalid:3128"
+MUDSH_TEST_VAR = "from-config"
+NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt"
+
 [llm]
 base_url = "http://127.0.0.1:9000/v1"
 api_key = "{real_key}"
@@ -50,6 +56,20 @@ id = "test-model"
 name = "Test Model"
 context_window = 131072
 max_tokens = 4096
+
+[[llm.models]]
+id = "other-model"
+context_window = 32768
+"""
+
+OVERRIDE_DEFAULT_MODEL = """\
+- id: agent-default-model
+  config:
+    provider: mu-dsh
+    model: other-model
+- id: session-telemetry-otel
+  config:
+    mode: ENABLED
 """
 
 
@@ -316,12 +336,29 @@ class SystemTest(unittest.TestCase):
         self.assertEqual(self.sh("stat -c '%U %a' /home/alice/.dsh").stdout.split(), ["alice", "700"])
         self.assertEqual(self.sh("stat -c '%U %a' /home/alice/.dsh/.env").stdout.split(), ["alice", "600"])
         key = self.gateway_state()["users"]["alice"]["llm_key"]
-        self.assertIn(f"MUDSH_LLM_KEY={key}", self.sh("cat /home/alice/.dsh/.env").stdout)
-        self.assertTrue(self.sh("head -1 /home/alice/.dsh/cordis.patch.yml").stdout.startswith("# Managed by mu-dsh"))
+        env = self.sh("cat /home/alice/.dsh/.env").stdout
+        self.assertTrue(env.startswith("# >>> mu-dsh managed >>>"), env)
+        self.assertIn(f"MUDSH_LLM_KEY={key}", env)
+        self.assertIn("HTTPS_PROXY='http://proxy.invalid:3128'", env)
+        self.assertIn("MUDSH_TEST_VAR='from-config'", env)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", env, "dsh refuses it in .env")
+        environ = self.sh(f"tr '\\0' '\\n' < /proc/{self.dsh_pid(20000)}/environ").stdout.splitlines()
+        self.assertIn("NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt", environ)
+        # The home-level patch holds only the policy; the defaults come from a shared bundle.
+        home_patch = self.sh("cat /home/alice/.dsh/cordis.patch.yml").stdout
+        self.assertTrue(home_patch.startswith("# Managed by mu-dsh"))
+        self.assertNotIn("llm-pi-ai", home_patch)
+        bundle = "/opt/mu-dsh/dsh/node_modules/mu-dsh-defaults"
+        self.assertEqual(self.sh(f"stat -c '%U %a' {bundle}/cordis.patch.yml").stdout.split(), ["root", "644"])
+        for profile in ("web", "headless"):
+            manifest = json.loads(self.sh(f"cat /home/alice/.dsh/profiles/{profile}/package.json").stdout)
+            self.assertEqual(manifest["dsh"]["profile"]["bundles"][-1], "mu-dsh-defaults")
         self.sh("test ! -e /home/carol/.dsh")
-        config = self.sh("runuser -l alice -c 'dsh --profile web --dump-config'").stdout
+        dump = self.sh("runuser -l alice -c 'dsh --profile web --dump-config'")
+        self.assertNotIn("mu-dsh-defaults", dump.stderr, "dsh skipped the defaults bundle")
+        config = dump.stdout
         self.assertIn("mode: DISABLED", config)
-        self.assertIn("provider: mu-dsh", config)
+        self.assertRegex(config, r"patched by mu-dsh-defaults\n- id: agent-default-model\n(?:.*\n)*?\s+model: test-model")
         self.assertRegex(config, r"id: web-search-deepseek\n(?:.*\n)*?\s+disabled: true")
         self.assertIn("baseURL: http://127.0.0.1:8401/v1", config)
 
@@ -422,6 +459,39 @@ class SystemTest(unittest.TestCase):
         self.assertEqual(b.get("/u/alice/").status, 200)
         # A new browser goes through the new token.
         self.signed_in("alice")
+
+    def test_12a_user_settings_override_defaults_not_policy(self):
+        patches = [f"/home/alice/.dsh/profiles/{p}/cordis.patch.yml" for p in ("web", "headless")]
+        for path in patches:
+            self.sh(f"runuser -u alice -- tee {path} >/dev/null", input=OVERRIDE_DEFAULT_MODEL)
+        self.sh("systemctl restart mu-dsh")
+        self.wait_up("alice", "bob")
+        for path in patches:
+            self.assertEqual(self.sh(f"cat {path}").stdout, OVERRIDE_DEFAULT_MODEL, "mu-dsh touched the user's patch")
+        config = self.sh("runuser -l alice -c 'dsh --profile web --dump-config'").stdout
+        self.assertRegex(config, r"- id: agent-default-model\n(?:.*\n)*?\s+model: other-model")
+        self.assertIn("mode: DISABLED", config)
+        self.sh("curl -sf -X DELETE http://127.0.0.1:9000/requests")
+        self.assertIn(FAKE_REPLY, self.sh("runuser -l alice -c 'dsh headless \"Say hi\"'", timeout=180).stdout)
+        self.assertEqual(self.fake_llm_requests()[0]["model"], "other-model")
+        for path in patches:
+            self.sh(f"runuser -u alice -- tee {path} >/dev/null", input="[]\n")
+
+    def test_12b_broken_user_config_is_shown(self):
+        b = self.signed_in("alice")
+        patch = "/home/alice/.dsh/profiles/web/cordis.patch.yml"
+        self.sh(f"runuser -u alice -- tee {patch} >/dev/null", input="- id: agent-default-model\n  config: [oops\n")
+        self.sh(f"kill -9 {self.dsh_pid(20000)}")
+        state = self.wait_state(
+            lambda s: "failed to parse" in (s["users"]["alice"]["error"] or ""), "alice's dsh error published", timeout=120
+        )
+        self.assertIn(patch, state["users"]["alice"]["error"])
+        page = b.get("/u/alice/")
+        self.assertEqual(page.status, 503)
+        self.assertIn(b"failed to parse", page.body)
+        self.sh(f"runuser -u alice -- tee {patch} >/dev/null", input="[]\n")
+        self.wait_up("alice")
+        self.assertEqual(self.signed_in("alice").get("/u/alice/").status, 200)
 
     def test_13_password_change(self):
         b = self.browser()

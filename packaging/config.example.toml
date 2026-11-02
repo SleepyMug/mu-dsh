@@ -35,6 +35,17 @@ extra_args = []
 # naming other packages after an upgrade, list them all here.
 # allow_install_scripts = ["@deepseek-ai/dsh-subprocess-local", "koffi", "node-pty", "protobufjs", "@google/genai"]
 
+# Environment for every user's dsh, e.g. an outbound proxy. Optional.
+# Variables dsh accepts in ~/.dsh/.env (proxies, ordinary variables) go there,
+# where a user may override them; the rest (NODE_EXTRA_CA_CERTS, NODE_OPTIONS,
+# DSH_*, ...) are set in dsh's launch environment. dsh never proxies loopback,
+# so the relay is unaffected. Values must be single-line strings.
+[dsh.env]
+# HTTPS_PROXY = "http://proxy.example.internal:3128"
+# HTTP_PROXY = "http://proxy.example.internal:3128"
+# NO_PROXY = "example.internal,.corp.example.internal"
+# NODE_EXTRA_CA_CERTS = "/usr/local/share/ca-certificates/corp.crt"
+
 [llm]
 # OpenAI-compatible inference service shared by everyone, and its real key.
 # Users never see this key: their dsh holds a per-user relay key instead.

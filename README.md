@@ -44,6 +44,11 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 1. Edit `[llm]` (`base_url`, `api_key`, `default_model`) and `[[llm.models]]` in `config.toml`.
 2. `sudo systemctl reload mu-dsh`
 
+**Proxy and other environment variables for users' dsh**
+1. Set them under `[dsh.env]` in `config.toml` (e.g. `HTTPS_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`).
+2. `sudo systemctl reload mu-dsh`
+- npm (dsh install): `sudo systemctl edit mu-dsh`, add `[Service]` / `Environment=HTTPS_PROXY=http://proxy:3128`.
+
 **mu-dsh update**
 - `git pull && sudo ./install.sh && sudo systemctl restart mu-dsh`
 
@@ -102,20 +107,33 @@ real uid is the user), so it changes the Unix password and follows the site's
 usual rules; mu-dsh adds none of its own. (`mu-dsh user add`/`passwd` are admin
 actions and set passwords directly.)
 
-### What mu-dsh writes in a user's home
+### How each user's dsh is configured
 
-Only two things, both inside `~/.dsh`:
+dsh loads a user's profile normally; mu-dsh adds a layer of defaults the user
+can override and a thin layer of policy they cannot. dsh composes, lowest first:
 
-* `~/.dsh/cordis.patch.yml` — dsh's home-level patch layer, applied to every
-  profile. mu-dsh owns and rewrites it: the relay as an `openai-completions`
-  provider, the default model, web search off, telemetry off. A pre-existing
-  file is kept as `cordis.patch.yml.pre-mu-dsh`.
-* a marked block in `~/.dsh/.env` with `MUDSH_LLM_KEY`, the user's relay key.
+| Layer | Written by | Contents |
+|---|---|---|
+| dsh's own bundles (`dsh-base`, `dsh-web-app`, …) | dsh | shipped defaults |
+| `mu-dsh-defaults` bundle (`/opt/mu-dsh/dsh/node_modules/`) | mu-dsh, shared, root-owned | the relay as the model provider, the default model |
+| `~/.dsh/profiles/<profile>/cordis.patch.yml` | the user, dsh's settings UI | anything, including other models or providers |
+| `~/.dsh/cordis.patch.yml` (home-level) | mu-dsh, rewritten each start | policy: web search off, telemetry off |
 
-Users' own settings go in `~/.dsh/profiles/<profile>/cordis.patch.yml` (the
-dsh settings UI writes there). Rows mu-dsh sets win over the same rows there.
-Users can also run `dsh` from their shell (`/usr/local/bin/dsh`); it picks up
-the same configuration.
+mu-dsh lists its bundle in every profile built on `dsh-base` (creating `web`
+and `headless` up front), right after dsh's own bundles, so the shell `dsh`
+(`/usr/local/bin/dsh`) gets the same setup. dsh's settings refuse edits that
+the home-level patch would override. A user file already at that path is kept
+once as `cordis.patch.yml.pre-mu-dsh`.
+
+`~/.dsh/.env` starts with a marked block holding `MUDSH_LLM_KEY` (the user's
+relay key) and the `[dsh.env]` variables dsh accepts there; lines the user
+adds below it win. Variables dsh only takes from its launch environment
+(`NODE_EXTRA_CA_CERTS`, `NODE_OPTIONS`, `DSH_*`, …) are set there instead, and
+apply only to the dsh mu-dsh runs.
+
+If a user's own configuration stops their dsh from starting, the gateway's
+"Starting" page shows dsh's error, and the supervisor keeps retrying until the
+file is fixed.
 
 ### How sign-in works
 
@@ -158,6 +176,7 @@ also deletes every managed user's account and home directory.
 |---|---|
 | `/opt/mu-dsh/{control,gateway}` | code |
 | `/opt/mu-dsh/dsh/versions/<v>`, `current` | pinned dsh installs (current + previous kept) |
+| `/opt/mu-dsh/dsh/node_modules/mu-dsh-defaults` | generated defaults bundle (provider, default model) |
 | `/etc/mu-dsh/config.toml` | configuration (0600; holds the upstream key) |
 | `/var/lib/mu-dsh/users.json`, `session-secret` | managed users, ports, relay keys |
 | `/run/mu-dsh/gateway.json`, `auth.sock` | control plane ↔ gateway (root:mu-dsh) |
@@ -205,7 +224,8 @@ the pinned dsh version changes. Every run then boots the base image with QEMU
 back. The suite installs mu-dsh with `install.sh`, starts a fake OpenAI-compatible
 upstream in the VM (`tests/vm/fake_llm.py`), and checks provisioning, sign-in,
 isolation, WebSockets, the relay, a real `dsh headless` model call, crash
-recovery, Unix password changes and locked accounts, reloads, a reboot, account
+recovery, user settings overriding defaults but not policy, a broken user
+configuration shown on the Starting page, Unix password changes and locked accounts, reloads, a reboot, account
 deletion, and uninstall.
 
 ```sh
@@ -228,4 +248,9 @@ For type-checking the gateway: `cd gateway && npm install && npm run typecheck`.
   removing a user does.
 * dsh's `web_search` tool may still be listed in agent presets; its backends
   are disabled, so calls to it fail.
+* dsh patches replace a row's whole config. Once a user edits the model
+  provider (e.g. in the Models page), their profile holds a full copy of it and
+  later `[[llm.models]]` changes no longer reach them until they reset it.
+* A profile the user creates later gets the defaults bundle the next time
+  their dsh is started by mu-dsh.
 * All enabled users' dsh instances start at boot (one Node process each).
