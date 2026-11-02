@@ -168,7 +168,24 @@ def _model(raw: object, index: int) -> dict:
         model[_MODEL_KEYS.get(key, key)] = value
     if not isinstance(model.get("id"), str) or not model["id"]:
         raise ConfigError(f"{where}.id is required")
+    efforts = model.get("reasoningEfforts")
+    if isinstance(efforts, dict):
+        model["reasoningEfforts"] = _efforts(efforts, f"{where}.reasoning_efforts")
     return model
+
+
+def _efforts(efforts: dict, where: str) -> dict:
+    """dsh spells "off sends nothing" as a level without a value (YAML null),
+    which TOML cannot write; ``off = ""`` stands for it here."""
+    result = {}
+    for level, wire in efforts.items():
+        if wire == "" and level == "off":
+            result[level] = None
+        elif not isinstance(wire, str) or not wire:
+            raise ConfigError(f"{where}.{level} must be a non-empty string (only off may be \"\")")
+        else:
+            result[level] = wire
+    return result
 
 
 def parse(data: dict) -> Config:

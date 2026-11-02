@@ -120,6 +120,15 @@ class ConfigTest(unittest.TestCase):
         # Launch-only variables never go to .env, so quotes are fine there.
         parse(CONFIG.replace("[dsh.env]\n", "[dsh.env]\nNODE_OPTIONS = \"--title='x'\"\n"))
 
+    def test_reasoning_efforts_off_without_value(self):
+        cfg = parse(CONFIG.replace('max_tokens = 8192', 'max_tokens = 8192\nreasoning_efforts = { off = "", high = "high" }'))
+        self.assertEqual(cfg.llm.models[1]["reasoningEfforts"], {"off": None, "high": "high"})
+        self.assertIn("\"off\": null\n", managed.defaults_text(cfg))
+        self.assertEqual(parse_yaml(managed.defaults_text(cfg))[0]["config"]["providers"]["mu-dsh"]["models"][1]["reasoningEfforts"],
+                         {"off": None, "high": "high"})
+        with self.assertRaisesRegex(config_mod.ConfigError, "reasoning_efforts.high must be a non-empty string"):
+            parse(CONFIG.replace('max_tokens = 8192', 'max_tokens = 8192\nreasoning_efforts = { high = "" }'))
+
     def test_listen_ipv6(self):
         self.assertEqual(config_mod.Listen.parse("[::1]:80", "x"), config_mod.Listen("::1", 80))
 

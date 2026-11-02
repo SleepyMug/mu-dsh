@@ -41,8 +41,13 @@ def _scalar(value: object) -> str:
     raise TypeError(f"cannot emit {type(value).__name__} as YAML")
 
 
+# Plain scalars YAML 1.1 parsers read as booleans or null (an effort level is named "off").
+_AMBIGUOUS = {"y", "n", "yes", "no", "on", "off", "true", "false", "null", "~"}
+
+
 def _key(key: str) -> str:
-    return key if _PLAIN_KEY.fullmatch(key) else json.dumps(key, ensure_ascii=False)
+    plain = _PLAIN_KEY.fullmatch(key) and key.lower() not in _AMBIGUOUS
+    return key if plain else json.dumps(key, ensure_ascii=False)
 
 
 def _emit(value: object, indent: int) -> list[str]:

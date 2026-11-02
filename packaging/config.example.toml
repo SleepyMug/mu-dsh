@@ -66,6 +66,9 @@ default_model = "my-model"
 # One table per model the service offers. Keys: id (required), name,
 # context_window, max_tokens, input (["text"] or ["text", "image"]),
 # reasoning_efforts. Other keys are passed to dsh unchanged.
+# reasoning_efforts lists the levels dsh's Effort menu offers, each mapped to
+# the value sent on the wire; off = "" means "off sends no value", e.g.
+#   reasoning_efforts = { off = "", high = "high", max = "max" }
 [[llm.models]]
 id = "my-model"
 name = "My Model"
