@@ -21,6 +21,12 @@ ${head}
   input { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; border: 1px solid #c4c8d0; border-radius: 6px; }
   button { margin-top: 1.25rem; width: 100%; padding: .6rem; font: inherit; font-weight: 600; color: #fff;
            background: #3657d6; border: 0; border-radius: 6px; cursor: pointer; }
+  form.inline button, a.button { margin-top: .5rem; }
+  button.secondary, a.button { display: block; box-sizing: border-box; width: 100%; padding: .6rem; text-align: center;
+           background: #fff; color: inherit; border: 1px solid #c4c8d0; border-radius: 6px; font-weight: 600;
+           text-decoration: none; }
+  .banner { background: #fff4ce; border: 1px solid #e0c060; border-radius: 6px; padding: .6rem; margin: 0 0 1rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .25rem; }
   .error { color: #b3261e; margin: 0 0 .5rem; }
   .ok { color: #1e7b34; margin: 0 0 .5rem; }
   nav a { display: block; margin: .5rem 0; padding: .6rem; text-align: center; border: 1px solid #c4c8d0;
@@ -52,18 +58,34 @@ ${next}<label for="username">User name</label>
   )
 }
 
-export function startingPage(user: string, error: string | null): string {
+export type Mode = 'normal' | 'recovery'
+
+/** A button that posts one workspace action (see Gateway.workspace). */
+function actionButton(action: string, label: string, primary = false): string {
+  return `<form class="inline" method="post" action="/account/workspace"><input type="hidden" name="action" value="${action}">
+<button type="submit"${primary ? '' : ' class="secondary"'}>${escapeHtml(label)}</button></form>`
+}
+
+const RECOVERY_BANNER = `<p class="banner" role="status"><b>Recovery mode.</b> Your own settings, plugins and
+<code>~/.env</code> are not loaded. Changes made in dsh's Settings now are temporary and are discarded when you leave
+recovery mode; fix your own files (for example <code>~/.dsh/profiles/web/cordis.patch.yml</code>) instead.</p>`
+
+export function startingPage(user: string, error: string | null, mode: Mode = 'normal'): string {
+  // Without an error the page refreshes itself until dsh is up; with one, the user chooses.
   const detail = error
-    ? `<p class="muted">It stopped last time. If the problem is in your own configuration, fix it from a shell
-(for example <code>~/.dsh/profiles/web/cordis.patch.yml</code>); dsh is retried automatically.</p>
-<pre class="problem">${escapeHtml(error)}</pre>`
-    : ''
+    ? `<p class="muted">Your workspace stopped. It is retried automatically; if the problem is in your own
+configuration, start in recovery mode to fix it, or reset your settings.</p>
+<pre class="problem">${escapeHtml(error)}</pre>
+${actionButton('restart', 'Retry now', true)}
+${mode === 'recovery' ? '' : actionButton('recover', 'Start in recovery mode')}
+<a class="button" href="/account/reset">Reset my settings…</a>`
+    : '<p>This page reloads automatically.</p>'
   return layout(
     'Starting · DeepSeek Harness',
     `<h1>Starting your workspace…</h1>
-<p>dsh for <b>${escapeHtml(user)}</b> is starting. This page reloads automatically.</p>
-${detail}<form method="post" action="/logout"><button type="submit">Sign out</button></form>`,
-    '<meta http-equiv="refresh" content="2">',
+${mode === 'recovery' ? RECOVERY_BANNER : ''}<p>dsh for <b>${escapeHtml(user)}</b> is ${error ? 'not running' : 'starting'}.</p>
+${detail}<form method="post" action="/logout"><button type="submit" class="secondary">Sign out</button></form>`,
+    error ? '<meta http-equiv="refresh" content="10">' : '<meta http-equiv="refresh" content="2">',
   )
 }
 
@@ -71,16 +93,35 @@ export function messagePage(title: string, message: string): string {
   return layout(title, `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p><p><a href="/">Home</a></p>`)
 }
 
-export function portalPage(user: string, notice?: string): string {
-  const message = notice ? `<p class="ok" role="status">${escapeHtml(notice)}</p>` : ''
+export function portalPage(user: string, options: { notice?: string; mode?: Mode } = {}): string {
+  const message = options.notice ? `<p class="ok" role="status">${escapeHtml(options.notice)}</p>` : ''
+  const recovery = options.mode === 'recovery'
   return layout(
     'DeepSeek Harness',
     `<h1>Hello, ${escapeHtml(user)}</h1>
-${message}<nav>
+${recovery ? RECOVERY_BANNER : ''}${message}<nav>
 <a class="primary" href="/u/${escapeHtml(user)}/">Open DeepSeek Harness</a>
 <a href="/account/password">Change password</a>
 </nav>
+<h2>Workspace</h2>
+<p class="muted">Restarting stops anything your agents are running.</p>
+${recovery ? actionButton('restart', 'Leave recovery mode', true) : actionButton('restart', 'Restart workspace')}
+${recovery ? '' : actionButton('recover', 'Start in recovery mode')}
+<a class="button" href="/account/reset">Reset my settings…</a>
 <form method="post" action="/logout"><button type="submit">Sign out</button></form>`,
+  )
+}
+
+export function resetPage(user: string): string {
+  return layout(
+    'Reset settings · DeepSeek Harness',
+    `<h1>Reset my settings</h1>
+<p>This sets your dsh settings for <b>${escapeHtml(user)}</b> aside and restarts your workspace with the site defaults.</p>
+<p class="muted">Your settings file <code>~/.dsh/profiles/web/cordis.patch.yml</code> is kept as
+<code>cordis.patch.yml.bak-&lt;time&gt;</code>. Sessions, stored keys and installed plugins are not touched.
+Running agents stop.</p>
+${actionButton('reset', 'Reset and restart', true)}
+<p><a href="/">Cancel</a></p>`,
   )
 }
 

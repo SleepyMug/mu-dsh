@@ -22,6 +22,10 @@ DEFAULTS_BUNDLE = "mu-dsh-defaults"
 BASE_BUNDLE = "@deepseek-ai/dsh-base"  # every profile built on it gets the defaults bundle
 PROFILE = "web"  # what the gateway serves
 PROFILES = ("web", "headless")  # created up front, so `dsh headless` in a shell has the defaults too
+# Recovery mode runs this profile instead of PROFILE: rebuilt from dsh's shipped
+# web template on every recovery start, so none of the user's settings or
+# plugins load; sessions and credentials live outside profiles and stay.
+RECOVERY_PROFILE = "mu-dsh-recovery"
 ENV_BEGIN = "# >>> mu-dsh managed >>>"
 ENV_END = "# <<< mu-dsh managed <<<"
 LLM_KEY_ENV = "MUDSH_LLM_KEY"

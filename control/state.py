@@ -7,15 +7,16 @@ plane and the Node gateway. Format (version 1)::
       "version": 1,
       "gateway": {"listen_host", "listen_port", "public_url", "session_max_age_days"},
       "session_secret": "...",
-      "auth_socket": "/run/mu-dsh/auth.sock",
+      "control_socket": "/run/mu-dsh/control.sock",
       "relay": {"listen_host", "listen_port", "upstream", "api_key"},
       "users": {
-        "<name>": {"port", "llm_key", "enabled", "up", "token", "error"}
+        "<name>": {"port", "llm_key", "enabled", "up", "token", "error", "mode"}
       }
     }
 
 ``token`` is the user's current dsh launch token, or null while it is not up.
-Passwords are checked over ``auth_socket`` (see authserver.py), never here.
+``mode`` is "normal" or "recovery". Passwords are checked and workspace actions
+requested over ``control_socket`` (see controlserver.py), never through here.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from control.config import Config
 from control.users import User
 
 
-def render(config: Config, users: dict[str, User], session_secret: str, auth_socket: str, status: dict[str, dict]) -> dict:
+def render(config: Config, users: dict[str, User], session_secret: str, control_socket: str, status: dict[str, dict]) -> dict:
     """Build the gateway.json payload from configuration, users, and process status."""
     return {
         "version": 1,
@@ -41,7 +42,7 @@ def render(config: Config, users: dict[str, User], session_secret: str, auth_soc
             "session_max_age_days": config.gateway.session_max_age_days,
         },
         "session_secret": session_secret,
-        "auth_socket": auth_socket,
+        "control_socket": control_socket,
         "relay": {
             "listen_host": config.relay.listen.host,
             "listen_port": config.relay.listen.port,
@@ -56,6 +57,7 @@ def render(config: Config, users: dict[str, User], session_secret: str, auth_soc
                 "up": bool(status.get(name, {}).get("up")),
                 "token": status.get(name, {}).get("token"),
                 "error": status.get(name, {}).get("error"),
+                "mode": status.get(name, {}).get("mode", "normal"),
             }
             for name, u in sorted(users.items())
         },

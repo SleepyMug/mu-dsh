@@ -2,7 +2,8 @@
 // Everything else receives its collaborators through its constructor.
 
 import { createServer, type Server } from 'node:http'
-import { Sessions, SocketPasswords, type Passwords } from './auth.ts'
+import { Sessions } from './auth.ts'
+import { SocketControl, type Control } from './control.ts'
 import { consoleLogger, type Logger } from './log.ts'
 import { messagePage } from './pages.ts'
 import { DshProxy } from './proxy.ts'
@@ -13,7 +14,7 @@ import type { StateSource } from './state.ts'
 export interface AppOptions {
   state: StateSource
   log?: Logger
-  passwords?: Passwords
+  control?: Control
   /** Where users' dsh instances listen. */
   dshHost?: string
 }
@@ -28,7 +29,7 @@ export function createApp(options: AppOptions): App {
   const gateway = new Gateway({
     state: options.state,
     sessions: new Sessions(options.state),
-    passwords: options.passwords ?? new SocketPasswords(options.state, log),
+    control: options.control ?? new SocketControl(options.state, log),
     proxy: new DshProxy(options.dshHost),
     log,
   })

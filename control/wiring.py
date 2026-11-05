@@ -10,9 +10,9 @@ from dataclasses import dataclass
 
 from control.accounts import Accounts
 from control.admin import UserAdmin
-from control.authserver import AuthServer
 from control.changes import Changes
 from control.config import ConfigFile
+from control.controlserver import ControlServer
 from control.daemon import Daemon
 from control.dshinstall import DshInstaller
 from control.hostnames import HostNames
@@ -24,6 +24,7 @@ from control.sitelayers import SiteLayers
 from control.state import SessionSecret, StateFile
 from control.supervisor import Launcher, SpecBuilder, Supervisor
 from control.users import UserStore
+from control.workspace import WorkspaceRequests
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ def build_services(paths: Paths) -> Services:
 
 def build_daemon(services: Services) -> Daemon:
     changes = Changes()
+    workspaces = WorkspaceRequests(changes)
     return Daemon(
         config_file=services.config_file,
         users=services.users,
@@ -75,5 +77,6 @@ def build_daemon(services: Services) -> Daemon:
         state_file=services.state_file,
         session_secret=services.session_secret,
         pid_file=services.pid_file,
-        auth_server=AuthServer(services.paths.auth_socket, services.users, PamAuthenticator()),
+        control_server=ControlServer(services.paths.control_socket, services.users, PamAuthenticator(), workspaces),
+        workspaces=workspaces,
     )

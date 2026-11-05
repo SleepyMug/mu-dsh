@@ -1,7 +1,7 @@
 """The managed-user registry (/var/lib/mu-dsh/users.json).
 
 Passwords are not stored here: each managed user is a Unix account, and the
-gateway checks sign-ins against it through PAM (see authserver.py).
+gateway checks sign-ins against it through PAM (see controlserver.py).
 """
 
 from __future__ import annotations

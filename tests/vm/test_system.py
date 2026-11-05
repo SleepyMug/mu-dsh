@@ -291,7 +291,7 @@ class SystemTest(unittest.TestCase):
         )
         self.sh("systemctl enable --now mu-dsh", timeout=900)  # first start installs dsh
         wait_until(lambda: self.sh("systemctl is-active mu-dsh-gateway", check=False).stdout.strip() == "active", what="gateway active")
-        self.assertEqual(self.sh("stat -c '%U %G %a' /run/mu-dsh/auth.sock").stdout.split(), ["root", "mu-dsh", "660"])
+        self.assertEqual(self.sh("stat -c '%U %G %a' /run/mu-dsh/control.sock").stdout.split(), ["root", "mu-dsh", "660"])
         self.sh("test -e /etc/pam.d/mu-dsh")
         install_log = self.sh("journalctl --no-pager -u mu-dsh").stdout
         self.assertIn(f"installing @deepseek-ai/dsh@{vmlib.DSH_VERSION}", install_log)
@@ -477,21 +477,84 @@ class SystemTest(unittest.TestCase):
         for path in patches:
             self.sh(f"runuser -u alice -- tee {path} >/dev/null", input="[]\n")
 
-    def test_12b_broken_user_config_is_shown(self):
+    def workspace(self, b: Browser, action: str) -> Response:
+        resp = b.request("POST", "/account/workspace", f"action={action}".encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual((resp.status, resp.header("location")), (303, "/u/alice/"), resp.body[:300])
+        return resp
+
+    def alice_in(self, mode: str, what: str) -> dict:
+        return self.wait_state(lambda s: s["users"]["alice"]["up"] and s["users"]["alice"]["mode"] == mode, what, timeout=180)
+
+    def dsh_argv_and_cwd(self, port: int) -> tuple[str, str]:
+        pid = self.dsh_pid(port)
+        argv = self.sh(f"tr '\\0' ' ' < /proc/{pid}/cmdline").stdout
+        return argv, self.sh(f"readlink /proc/{pid}/cwd").stdout.strip()
+
+    def test_12b_broken_config_and_recovery_mode(self):
         b = self.signed_in("alice")
         patch = "/home/alice/.dsh/profiles/web/cordis.patch.yml"
-        self.sh(f"runuser -u alice -- tee {patch} >/dev/null", input="- id: agent-default-model\n  config: [oops\n")
+        broken = "- id: agent-default-model\n  config: [oops\n"
+        self.sh(f"runuser -u alice -- tee {patch} >/dev/null", input=broken)
+        # A variable dsh refuses in .env stops it before it even reads the profile.
+        self.sh("runuser -u alice -- tee -a /home/alice/.dsh/.env >/dev/null", input="PATH=/broken\n")
         self.sh(f"kill -9 {self.dsh_pid(20000)}")
-        state = self.wait_state(
-            lambda s: "failed to parse" in (s["users"]["alice"]["error"] or ""), "alice's dsh error published", timeout=120
-        )
-        self.assertIn(patch, state["users"]["alice"]["error"])
+        state = self.wait_state(lambda s: "PATH" in (s["users"]["alice"]["error"] or ""), "alice's dsh error published", timeout=120)
+        self.assertIn("only the launching environment may set", state["users"]["alice"]["error"])
         page = b.get("/u/alice/")
         self.assertEqual(page.status, 503)
-        self.assertIn(b"failed to parse", page.body)
+        self.assertIn(b"Start in recovery mode", page.body)
+
+        self.workspace(b, "recover")
+        self.alice_in("recovery", "alice up in recovery mode")
+        argv, cwd = self.dsh_argv_and_cwd(20000)
+        self.assertIn("--profile mu-dsh-recovery", argv)
+        self.assertEqual(cwd, "/home/alice/.dsh")
+        self.assertIn("# mu-dsh recovery disabled this line; dsh refuses PATH in .env: PATH=/broken",
+                      self.sh("cat /home/alice/.dsh/.env").stdout)
+        self.assertEqual(self.sh(f"cat {patch}").stdout, broken, "recovery leaves the user's settings alone")
+        self.assertIn(b"Recovery mode.", b.get("/").body)
+        self.assertEqual(b.follow("/u/alice/")[-1].status, 200, "the workspace works in recovery mode")
+
         self.sh(f"runuser -u alice -- tee {patch} >/dev/null", input="[]\n")
+        self.workspace(b, "restart")  # "Leave recovery mode"
+        self.alice_in("normal", "alice up normally again")
+        self.assertIn("--profile web", self.dsh_argv_and_cwd(20000)[0])
+        self.assertNotIn(b"Recovery mode.", b.get("/").body)
+
+    def test_12c_restart_reset_and_admin_commands(self):
+        b = self.signed_in("alice")
+        old_pid, old_token = self.dsh_pid(20000), self.gateway_state()["users"]["alice"]["token"]
+        self.workspace(b, "restart")
+        self.wait_state(lambda s: s["users"]["alice"]["up"] and s["users"]["alice"]["token"] != old_token, "alice restarted")
+        self.assertNotEqual(self.dsh_pid(20000), old_pid)
+        self.assertEqual(b.get("/u/alice/").status, 200, "the browser stays signed in to dsh")
+
+        patch = "/home/alice/.dsh/profiles/web/cordis.patch.yml"
+        self.sh(f"runuser -u alice -- tee {patch} >/dev/null", input=OVERRIDE_DEFAULT_MODEL)
+        old_token = self.gateway_state()["users"]["alice"]["token"]
+        self.assertIn(b'value="reset"', b.get("/account/reset").body)
+        self.workspace(b, "reset")
+        self.wait_state(lambda s: s["users"]["alice"]["up"] and s["users"]["alice"]["token"] != old_token, "alice reset")
+        self.assertEqual(self.sh(f"cat {patch}").stdout, "[]\n")
+        self.assertEqual(self.sh(f"cat {patch}.bak-*").stdout, OVERRIDE_DEFAULT_MODEL)
+
+        out = self.sh("mu-dsh user restart alice --recovery").stdout
+        self.assertIn("recovery mode", out)
+        self.alice_in("recovery", "alice in recovery via the CLI")
+        self.assertRegex(self.sh("mu-dsh user list").stdout, r"alice\s+20000\s+yes\s+up \(recovery mode\)")
+        # Recovery mode does not outlive the service.
+        self.sh("systemctl restart mu-dsh", timeout=180)
+        self.wait_up("alice", "bob")
+        self.alice_in("normal", "alice normal after a service restart")
+        bob_pid = self.dsh_pid(20001)
+        self.sh("mu-dsh user restart alice")
+        self.alice_in("normal", "alice up after a CLI restart")
+        self.assertIn("set alice's web profile settings aside", self.sh("mu-dsh user reset-settings alice").stdout)
         self.wait_up("alice")
-        self.assertEqual(self.signed_in("alice").get("/u/alice/").status, 200)
+        self.assertEqual(self.dsh_pid(20001), bob_pid, "other users are not restarted")
+        refused = self.sh("mu-dsh user restart carol", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("not an enabled mu-dsh user", refused.stderr)
 
     def test_13_password_change(self):
         b = self.browser()

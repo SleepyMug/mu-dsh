@@ -8,12 +8,14 @@ import logging
 import sys
 
 from control.accounts import AccountError, check_name, check_password
+from control import controlserver
 from control.config import ConfigError
 from control.dshinstall import InstallError, find_node
 from control.paths import Paths
 from control.provision import ProvisionError
 from control.users import UserError
 from control.wiring import Services, build_daemon, build_services
+from control.workspace import RECOVER, RESET, RESTART
 
 
 def _read_password(args) -> str:
@@ -79,6 +81,25 @@ def cmd_user_rotate_key(s: Services, args) -> int:
     return 0
 
 
+def _workspace(s: Services, name: str, action: str) -> None:
+    reply = controlserver.ask(s.paths.control_socket, {"op": "workspace", "user": name, "action": action})
+    if not reply.get("ok"):
+        raise UserError(reply.get("error") or "the service refused the request")
+
+
+def cmd_user_restart(s: Services, args) -> int:
+    _workspace(s, args.name, RECOVER if args.recovery else RESTART)
+    mode = "in recovery mode (without their own settings and plugins)" if args.recovery else "normally"
+    print(f"restarting {args.name}'s dsh {mode}")
+    return 0
+
+
+def cmd_user_reset_settings(s: Services, args) -> int:
+    _workspace(s, args.name, RESET)
+    print(f"set {args.name}'s web profile settings aside (cordis.patch.yml.bak-*) and restarted their dsh")
+    return 0
+
+
 def cmd_user_list(s: Services, args) -> int:
     users = s.users.load()
     if args.names:
@@ -90,6 +111,9 @@ def cmd_user_list(s: Services, args) -> int:
     for name, u in sorted(users.items()):
         info = live.get(name, {})
         status = "up" if info.get("up") else ("disabled" if not u.enabled else info.get("error") or "down")
+        status = status.splitlines()[0] if status else status
+        if info.get("mode") == "recovery":
+            status += " (recovery mode)"
         rows.append((name, str(u.port), "yes" if u.enabled else "no", status))
     widths = [max(len(r[i]) for r in rows) for i in range(3)]
     for r in rows:
@@ -130,6 +154,15 @@ def build_parser() -> argparse.ArgumentParser:
     rk.add_argument("name")
     rk.set_defaults(func=cmd_user_rotate_key)
 
+    rs = user.add_parser("restart", help="restart a user's dsh now (also leaves recovery mode)")
+    rs.add_argument("name")
+    rs.add_argument("--recovery", action="store_true", help="start without the user's own settings, plugins and ~/.env")
+    rs.set_defaults(func=cmd_user_restart)
+
+    rset = user.add_parser("reset-settings", help="set a user's dsh settings aside (kept as a backup) and restart")
+    rset.add_argument("name")
+    rset.set_defaults(func=cmd_user_reset_settings)
+
     ls = user.add_parser("list", help="list managed users")
     ls.add_argument("--names", action="store_true", help="print only user names, one per line")
     ls.set_defaults(func=cmd_user_list)
@@ -145,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         return args.func(build_services(Paths.from_env()), args)
-    except (UserError, AccountError, ConfigError, InstallError, ProvisionError) as e:
+    except (UserError, AccountError, ConfigError, InstallError, ProvisionError, ConnectionError, TimeoutError) as e:
         print(f"mu-dsh: {e}", file=sys.stderr)
         return 1
     except PermissionError as e:

@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { createApp } from '../src/app.ts'
-import { SocketPasswords, createSession, parseCookies, readSession, stripCookie } from '../src/auth.ts'
+import { createSession, parseCookies, readSession, stripCookie } from '../src/auth.ts'
+import { SocketControl } from '../src/control.ts'
 import type { Logger } from '../src/log.ts'
 import { rewriteLocation, rewriteSetCookie } from '../src/proxy.ts'
 import { upstreamUrl } from '../src/relay.ts'
@@ -18,8 +19,9 @@ function memoryLogger(): Logger & { lines: string[] } {
   return { lines, info: (m) => lines.push(m), error: (m) => lines.push(m) }
 }
 
-/** Stands in for control/authserver.py: one password per listed user, changeable. */
-function fakeAuthServer(path: string, users: string[], password: string): Promise<NetServer> {
+/** Stands in for control/controlserver.py: one password per listed user, changeable;
+ * workspace requests are recorded in `actions`. */
+function fakeControlServer(path: string, users: string[], password: string, actions: string[] = []): Promise<NetServer> {
   const passwords = new Map(users.map((u) => [u, password]))
   const server = createNetServer((socket) => {
     let buffer = ''
@@ -27,9 +29,18 @@ function fakeAuthServer(path: string, users: string[], password: string): Promis
     socket.on('data', (chunk: string) => {
       buffer += chunk
       if (!buffer.includes('\n')) return
-      const req = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as { op: string; user: string; password: string; new_password?: string }
+      const req = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as {
+        op: string
+        user: string
+        password: string
+        new_password?: string
+        action?: string
+      }
       const ok = passwords.get(req.user) === req.password
-      if (req.op === 'change_password') {
+      if (req.op === 'workspace') {
+        actions.push(`${req.user}:${req.action}`)
+        socket.end(JSON.stringify({ ok: true }) + '\n')
+      } else if (req.op === 'change_password') {
         if (ok) passwords.set(req.user, req.new_password ?? '')
         socket.end(JSON.stringify(ok ? { ok } : { ok, error: 'The current password is wrong.' }) + '\n')
       } else {
@@ -58,11 +69,12 @@ describe('auth', () => {
 
   it('asks the control plane socket and treats failures as refusals', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mu-dsh-test-'))
-    const path = join(dir, 'auth.sock')
+    const path = join(dir, 'control.sock')
     const log = memoryLogger()
-    const state = new MemoryState({ auth_socket: path, users: {} } as unknown as GatewayState)
-    const verifier = new SocketPasswords(state, log)
-    const server = await fakeAuthServer(path, ['alice'], 'secret')
+    const state = new MemoryState({ control_socket: path, users: {} } as unknown as GatewayState)
+    const verifier = new SocketControl(state, log)
+    const actions: string[] = []
+    const server = await fakeControlServer(path, ['alice'], 'secret', actions)
     try {
       assert.equal(await verifier.verify('alice', 'secret'), true)
       assert.equal(await verifier.verify('alice', 'wrong'), false)
@@ -70,9 +82,12 @@ describe('auth', () => {
       assert.equal(await verifier.change('alice', 'wrong', 'next-secret'), 'The current password is wrong.')
       assert.equal(await verifier.change('alice', 'secret', 'next-secret'), undefined)
       assert.equal(await verifier.verify('alice', 'next-secret'), true)
+      assert.equal(await verifier.workspace('alice', 'recover'), undefined)
+      assert.deepEqual(actions, ['alice:recover'])
       server.close()
       assert.equal(await verifier.verify('alice', 'secret'), false)
-      assert.match(log.lines.join('\n'), /password service failed/)
+      assert.equal(await verifier.workspace('alice', 'restart'), 'The service did not respond.')
+      assert.match(log.lines.join('\n'), /control socket failed/)
     } finally {
       server.close()
       rmSync(dir, { recursive: true, force: true })
@@ -157,10 +172,12 @@ describe('gateway and relay', () => {
   const seen: { auth?: string; path?: string }[] = []
   const log = memoryLogger()
   const dir = mkdtempSync(join(tmpdir(), 'mu-dsh-test-'))
-  let auth: NetServer
+  const actions: string[] = []
+  let control: NetServer
+  let memory: MemoryState
 
   before(async () => {
-    auth = await fakeAuthServer(join(dir, 'auth.sock'), ['alice', 'bob'], 'secret')
+    control = await fakeControlServer(join(dir, 'control.sock'), ['alice', 'bob'], 'secret', actions)
     const dsh = fakeDsh('tok123')
     const upstream = createServer((req, res) => {
       seen.push({ auth: req.headers.authorization, path: req.url })
@@ -174,14 +191,15 @@ describe('gateway and relay', () => {
       version: 1,
       gateway: { listen_host: '127.0.0.1', listen_port: 0, public_url: 'http://gw.test:8080', session_max_age_days: 1 },
       session_secret: 'test-secret',
-      auth_socket: join(dir, 'auth.sock'),
+      control_socket: join(dir, 'control.sock'),
       relay: { listen_host: '127.0.0.1', listen_port: 0, upstream: `http://127.0.0.1:${upstreamPort}/v1`, api_key: 'REAL' },
       users: {
-        alice: { port: dshPort, llm_key: 'key-alice', enabled: true, up: true, token: 'tok123', error: null },
-        bob: { port: 1, llm_key: 'key-bob', enabled: false, up: false, token: null, error: null },
+        alice: { port: dshPort, llm_key: 'key-alice', enabled: true, up: true, token: 'tok123', error: null, mode: 'normal' },
+        bob: { port: 1, llm_key: 'key-bob', enabled: false, up: false, token: null, error: null, mode: 'normal' },
       },
     }
-    const app = createApp({ state: new MemoryState(state), log })
+    memory = new MemoryState(state)
+    const app = createApp({ state: memory, log })
     servers.push(app.gateway, app.relay)
     gwPort = await listen(app.gateway)
     relayPort = await listen(app.relay)
@@ -192,7 +210,7 @@ describe('gateway and relay', () => {
       s.closeAllConnections()
       s.close()
     }
-    auth.close()
+    control.close()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -267,6 +285,49 @@ describe('gateway and relay', () => {
       call(gwPort, 'POST', '/login', { 'content-type': 'application/x-www-form-urlencoded' }, `username=alice&password=${pw}`)
     assert.equal((await relogin('secret')).status, 401)
     assert.equal((await relogin('new-secret')).status, 303)
+  })
+
+  it('restarts the workspace, enters and leaves recovery mode, and resets settings', async () => {
+    const login = await call(gwPort, 'POST', '/login', { 'content-type': 'application/x-www-form-urlencoded' }, 'username=alice&password=new-secret')
+    const session = String(login.headers['set-cookie']?.[0]).split(';')[0]
+    const form = { 'content-type': 'application/x-www-form-urlencoded', cookie: session }
+    const setAlice = (patch: Partial<GatewayState['users'][string]>) => {
+      const current = memory.current
+      memory.set({ ...current, users: { ...current.users, alice: { ...current.users.alice, ...patch } } })
+    }
+
+    const portal = await call(gwPort, 'GET', '/', { cookie: session })
+    assert.match(portal.body, /value="restart"/)
+    assert.match(portal.body, /value="recover"/)
+    assert.match(portal.body, /href="\/account\/reset"/)
+    assert.doesNotMatch(portal.body, /Recovery mode\./)
+
+    assert.equal((await call(gwPort, 'POST', '/account/workspace', { 'content-type': 'application/x-www-form-urlencoded' }, 'action=restart')).headers.location, '/login')
+    assert.equal((await call(gwPort, 'GET', '/account/workspace', { cookie: session })).status, 303, 'GET does nothing')
+    assert.equal((await call(gwPort, 'POST', '/account/workspace', form, 'action=format-disk')).status, 400)
+    assert.deepEqual(actions, [])
+
+    for (const action of ['recover', 'restart', 'reset']) {
+      const done = await call(gwPort, 'POST', '/account/workspace', form, `action=${action}`)
+      assert.equal(done.status, 303)
+      assert.equal(done.headers.location, '/u/alice/')
+    }
+    assert.deepEqual(actions, ['alice:recover', 'alice:restart', 'alice:reset'])
+    assert.match((await call(gwPort, 'GET', '/account/reset', { cookie: session })).body, /value="reset"/)
+
+    setAlice({ mode: 'recovery' })
+    const inRecovery = await call(gwPort, 'GET', '/', { cookie: session })
+    assert.match(inRecovery.body, /Recovery mode\./)
+    assert.match(inRecovery.body, /Leave recovery mode/)
+    assert.doesNotMatch(inRecovery.body, /value="recover"/)
+
+    setAlice({ up: false, token: null, error: 'exited with status 1 after 2s:\nError: dsh: failed to parse overlay', mode: 'normal' })
+    const starting = await call(gwPort, 'GET', '/u/alice/', { cookie: session, accept: 'text/html' })
+    assert.equal(starting.status, 503)
+    assert.match(starting.body, /failed to parse overlay/)
+    assert.match(starting.body, /Retry now/)
+    assert.match(starting.body, /value="recover"/)
+    setAlice({ up: true, token: 'tok123', error: null })
   })
 
   it('relays with the real key and rejects unknown or disabled keys', async () => {

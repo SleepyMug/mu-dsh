@@ -33,6 +33,8 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 - Set password (admin, no rules applied): `sudo mu-dsh user passwd alice`
 - Disable / enable (stops dsh and web sign-in): `sudo mu-dsh user disable|enable alice`
 - New relay key: `sudo mu-dsh user rotate-key alice`
+- Restart their dsh: `sudo mu-dsh user restart alice` (`--recovery`: without their own settings)
+- Set their dsh settings aside: `sudo mu-dsh user reset-settings alice`
 - Remove (deletes account and home): `sudo mu-dsh user del alice`
 - List: `sudo mu-dsh user list`
 
@@ -61,8 +63,12 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 
 **What users do**
 1. Open the public URL; sign in with their Unix user name and password.
-2. They land in their own dsh. `/` has "Change password" and "Sign out".
+2. They land in their own dsh. `/` has "Change password", the workspace actions below, and "Sign out".
 3. A web password change follows the same rules as `passwd` and changes the Unix password; `passwd` in a shell works too.
+4. Workspace actions on `/` (and on the "Starting" page when dsh will not start):
+   - **Restart workspace** — e.g. after editing `~/.dsh/.env`.
+   - **Start in recovery mode** — dsh without their own settings, plugins and `~/.env`, to fix them; **Leave recovery mode** returns.
+   - **Reset my settings…** — sets `~/.dsh/profiles/web/cordis.patch.yml` aside as `.bak-<time>` and restarts.
 
 ## Components
 
@@ -73,8 +79,10 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 
 They share two things in `/run/mu-dsh`: `gateway.json` (users and process state,
 format in `control/state.py`), written by the Python side and watched by the
-gateway; and `auth.sock`, where the gateway asks the root daemon to check a
-password through PAM (`control/authserver.py`).
+gateway; and `control.sock` (`control/controlserver.py`), where the gateway asks
+the root daemon to check or change a password through PAM and to carry out a
+signed-in user's workspace actions. The `mu-dsh user restart` and
+`reset-settings` commands use the same socket.
 
 Both halves use plain constructor injection: every class receives its
 collaborators, and one composition root per half builds them all, so
@@ -82,13 +90,14 @@ reading it shows how the system fits together.
 
 * `control/wiring.py` — `UserStore` + `Accounts` → `UserAdmin` (user lifecycle);
   `Provisioner` → `Launcher` → `Supervisor`; `DshInstaller` → `SpecBuilder`;
-  `UserStore` + `PamAuthenticator` → `AuthServer`; all of them plus `ConfigFile`,
-  `StateFile`, `SessionSecret`, and `PidFile` → `Daemon`. `cli.py` only parses
-  arguments and calls these services.
+  `UserStore` + `PamAuthenticator` + `WorkspaceRequests` → `ControlServer`; all of
+  them plus `SiteLayers`, `ConfigFile`, `StateFile`, `SessionSecret`, and `PidFile`
+  → `Daemon`, which carries out queued workspace requests on its main loop.
+  `cli.py` only parses arguments and calls these services.
 * `gateway/src/app.ts` — a `StateSource` (`StateFile` in production,
-  `MemoryState` in tests), `Sessions`, a `PasswordVerifier`
-  (`SocketPasswordVerifier`), `DshProxy`, and a `Logger` → `Gateway`;
-  `StateSource` + `Logger` → `Relay`. `main.ts` only loads the state file and listens.
+  `MemoryState` in tests), `Sessions`, a `Control` (`SocketControl`), `DshProxy`,
+  and a `Logger` → `Gateway`; `StateSource` + `Logger` → `Relay`. `main.ts` only
+  loads the state file and listens.
 
 ### Users are Unix accounts
 
@@ -133,7 +142,20 @@ apply only to the dsh mu-dsh runs.
 
 If a user's own configuration stops their dsh from starting, the gateway's
 "Starting" page shows dsh's error, and the supervisor keeps retrying until the
-file is fixed.
+file is fixed. From there (or from `/`) the user can:
+
+* **Start in recovery mode.** mu-dsh rebuilds the profile `mu-dsh-recovery`
+  from dsh's shipped web template (`dsh --from-default-profile web`) plus the
+  defaults bundle, and runs that instead of `web`, started in `~/.dsh` so that
+  `~/.env` is not read. The user's settings and plugins do not load; sessions,
+  stored keys, the policy and `~/.dsh/.env` do, except that lines naming
+  variables dsh refuses there (`PATH`, `DSH_*`, …) are commented out with a
+  note. Settings changed while in recovery mode go to the throwaway profile.
+  Recovery mode lasts until the user leaves it or the service restarts.
+* **Reset my settings.** The user's `profiles/web/cordis.patch.yml` is renamed
+  to `cordis.patch.yml.bak-<ms>` and replaced by an empty one; installed plugins
+  stay installed.
+* **Restart workspace**, which also skips the retry backoff.
 
 ### How sign-in works
 
@@ -179,7 +201,7 @@ also deletes every managed user's account and home directory.
 | `/opt/mu-dsh/dsh/node_modules/mu-dsh-defaults` | generated defaults bundle (provider, default model) |
 | `/etc/mu-dsh/config.toml` | configuration (0600; holds the upstream key) |
 | `/var/lib/mu-dsh/users.json`, `session-secret` | managed users, ports, relay keys |
-| `/run/mu-dsh/gateway.json`, `auth.sock` | control plane ↔ gateway (root:mu-dsh) |
+| `/run/mu-dsh/gateway.json`, `control.sock` | control plane ↔ gateway (root:mu-dsh) |
 | `/etc/pam.d/mu-dsh` | PAM service for web sign-ins (kept if edited) |
 
 ## Configuration
@@ -196,6 +218,8 @@ mu-dsh user del NAME                        # deletes the account and its home
 mu-dsh user passwd NAME [--password-stdin]  # same as passwd; no reload needed
 mu-dsh user enable|disable NAME
 mu-dsh user rotate-key NAME             # new relay key; restarts that user's dsh
+mu-dsh user restart NAME [--recovery]   # restart now; --recovery skips the user's own settings
+mu-dsh user reset-settings NAME         # back up and clear their dsh settings, then restart
 mu-dsh user list [--names]
 mu-dsh check-config
 mu-dsh install-dsh                      # systemd runs this before every start

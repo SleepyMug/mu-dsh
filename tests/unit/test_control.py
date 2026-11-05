@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -20,12 +21,13 @@ from control import config as config_mod  # noqa: E402
 from control import dshenv, managed, state, supervisor  # noqa: E402
 from control.accounts import Account, AccountError, Accounts  # noqa: E402
 from control.admin import UserAdmin  # noqa: E402
-from control.authserver import AuthServer  # noqa: E402
+from control.controlserver import ControlServer  # noqa: E402
 from control.changes import Changes  # noqa: E402
 from control.provision import Provision, Provisioner  # noqa: E402
 from control.sitelayers import Layers, SiteLayers  # noqa: E402
 from control.state import SessionSecret, StateFile  # noqa: E402
 from control.users import User, UserError, UserStore, allocate_port  # noqa: E402
+from control.workspace import WorkspaceRequests  # noqa: E402
 
 CONFIG = textwrap.dedent(
     """
@@ -355,7 +357,7 @@ class FakePam:
         return None
 
 
-class AuthServerTest(unittest.TestCase):
+class ControlServerTest(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.store = UserStore(self.dir / "users.json", self.dir / "users.lock")
@@ -363,7 +365,10 @@ class AuthServerTest(unittest.TestCase):
         self.store.add("bob", 20000)
         self.store.set_enabled("bob", False)
         self.pam = FakePam()
-        self.server = AuthServer(self.dir / "auth.sock", self.store, self.pam, refusal_delay=0)
+        self.workspaces = WorkspaceRequests(Changes())
+        self.server = ControlServer(
+            self.dir / "control.sock", self.store, self.pam, self.workspaces, refusal_delay=0, workspace_timeout=5
+        )
         self.server.start("nonexistent-group")
 
     def tearDown(self):
@@ -374,7 +379,7 @@ class AuthServerTest(unittest.TestCase):
         import socket
 
         with socket.socket(socket.AF_UNIX) as s:
-            s.connect(str(self.dir / "auth.sock"))
+            s.connect(str(self.dir / "control.sock"))
             s.sendall(raw)
             return json.loads(s.makefile().readline())
 
@@ -388,7 +393,7 @@ class AuthServerTest(unittest.TestCase):
         self.assertFalse(ask("root", "right"))  # not managed
         self.assertFalse(ask("alice", ""))
         self.assertEqual(self.pam.checked, ["alice", "alice"])
-        self.assertEqual(oct(os.stat(self.dir / "auth.sock").st_mode & 0o777), "0o660")
+        self.assertEqual(oct(os.stat(self.dir / "control.sock").st_mode & 0o777), "0o660")
 
     def test_change_password(self):
         def change(user, current, new):
@@ -405,18 +410,54 @@ class AuthServerTest(unittest.TestCase):
         self.assertEqual(change("alice", "right", "new-password"), {"ok": True})
         self.assertEqual(self.pam.changed, [("alice", "new-password")])
 
+    def test_workspace_requests_wait_for_the_daemon(self):
+        import threading
+
+        seen = []
+
+        def daemon_loop():  # what Daemon.carry_out does, minus the supervisor
+            while len(seen) < 2:
+                for request in self.workspaces.take():
+                    seen.append((request.user, request.action))
+                    request.finish("not running" if request.action == "reset" else None)
+                time.sleep(0.01)
+
+        thread = threading.Thread(target=daemon_loop)
+        thread.start()
+
+        def ask(user, action):
+            return self.ask(json.dumps({"op": "workspace", "user": user, "action": action}).encode() + b"\n")
+
+        self.assertEqual(ask("alice", "recover"), {"ok": True})
+        self.assertEqual(ask("alice", "reset"), {"ok": False, "error": "not running"})
+        thread.join(5)
+        self.assertEqual(seen, [("alice", "recover"), ("alice", "reset")])
+        # Refused before reaching the daemon.
+        self.assertFalse(ask("bob", "restart")["ok"])
+        self.assertFalse(ask("root", "restart")["ok"])
+        self.assertIn("unknown action", ask("alice", "format")["error"])
+        self.assertEqual(self.workspaces.take(), [])
+
+    def test_ask_reports_a_stopped_daemon(self):
+        from control import controlserver
+
+        with self.assertRaisesRegex(ConnectionError, "not running"):
+            controlserver.ask(self.dir / "missing.sock", {"op": "workspace"})
+
     def test_malformed_requests_are_refused(self):
         for raw in (b"not json\n", b"[]\n", b'{"user": 1, "password": "right"}\n'):
             with self.subTest(raw=raw):
                 self.assertEqual(self.ask(raw), {"ok": False})
 
 
-# Stands in for `dsh --profile <p> --dump-default-config`, which creates a profile from dsh's template.
+# Stands in for `dsh --profile <p> [--from-default-profile <t>] --dump-default-config`, which
+# creates a profile from dsh's template and, like dsh, refuses a directory that already exists.
 FAKE_DSH = (
     sys.executable, "-c",
-    "import json, os, sys; p = sys.argv[2]; d = os.path.join(os.environ['DSH_HOME'], 'profiles', p);"
-    "os.makedirs(d); json.dump({'name': 'dsh-profile-' + p, 'dsh': {'profile': {'bundles':"
-    " ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-' + p]}}}, open(os.path.join(d, 'package.json'), 'w'))",
+    "import json, os, sys; a = sys.argv; p = a[2]; t = a[a.index('--from-default-profile') + 1] if '--from-default-profile' in a else p;"
+    "d = os.path.join(os.environ['DSH_HOME'], 'profiles', p); os.makedirs(d);"
+    "json.dump({'name': 'dsh-profile-' + p, 'dsh': {'profile': {'bundles':"
+    " ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-' + t]}}}, open(os.path.join(d, 'package.json'), 'w'))",
 )
 
 
@@ -434,14 +475,47 @@ class UserFilesTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.home)
 
-    def apply(self, key="mudsh-key1", env=(("HTTPS_PROXY", "http://proxy:3128"),)):
+    def apply(self, key="mudsh-key1", env=(("HTTPS_PROXY", "http://proxy:3128"),), recovery=False, reset=False):
         self.provisioner.apply(Provision(
             account=self.account,
             env_block=managed.env_block(key, env),
             home_patch=managed.policy_text(),
             dsh=FAKE_DSH,
             env=(("DSH_HOME", str(self.dsh)), ("PATH", "/usr/bin:/bin")),
-        ))
+            recovery=recovery,
+        ), reset=reset)
+
+    def test_recovery_rebuilds_its_profile_and_disables_refused_env_lines(self):
+        self.apply()
+        web_patch = self.dsh / "profiles" / "web" / "cordis.patch.yml"
+        web_patch.write_text("- id: broken\n")
+        (self.dsh / ".env").write_text("FOO=1\nPATH=/evil\nexport dsh_debug=1\nHTTPS_PROXY=http://mine:1\n")
+        recovery = self.dsh / "profiles" / managed.RECOVERY_PROFILE
+        for _ in range(2):  # rebuilt each time, although dsh refuses an existing directory
+            (recovery / "leftover").parent.mkdir(parents=True, exist_ok=True)
+            (recovery / "leftover").write_text("x")
+            self.apply(recovery=True)
+            self.assertFalse((recovery / "leftover").exists())
+        self.assertEqual(self.bundles(managed.RECOVERY_PROFILE), ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web", "mu-dsh-defaults"])
+        self.assertEqual(web_patch.read_text(), "- id: broken\n", "recovery must not touch the user's settings")
+        env = (self.dsh / ".env").read_text()
+        self.assertIn("\nFOO=1\n", env)
+        self.assertIn("# mu-dsh recovery disabled this line; dsh refuses PATH in .env: PATH=/evil\n", env)
+        self.assertIn("dsh refuses dsh_debug in .env: export dsh_debug=1\n", env)
+        self.assertIn("\nHTTPS_PROXY=http://mine:1\n", env, "proxies are allowed in ~/.dsh/.env")
+        self.apply(recovery=True)
+        self.assertEqual((self.dsh / ".env").read_text(), env, "disabling is idempotent")
+
+    def test_reset_sets_the_web_settings_aside(self):
+        self.apply()
+        web_patch = self.dsh / "profiles" / "web" / "cordis.patch.yml"
+        web_patch.write_text("- id: broken\n")
+        self.apply(reset=True)
+        self.assertEqual(web_patch.read_text(), "[]\n")
+        backups = list(web_patch.parent.glob("cordis.patch.yml.bak-*"))
+        self.assertEqual([b.read_text() for b in backups], ["- id: broken\n"])
+        self.apply()
+        self.assertEqual(web_patch.read_text(), "[]\n")
 
     def bundles(self, profile="web"):
         manifest = self.dsh / "profiles" / profile / "package.json"
@@ -540,13 +614,22 @@ class SpecBuilderTest(unittest.TestCase):
         def authorities(self):
             return ["10.0.0.5", "gw"]
 
-    def build(self, cfg):
+    def build(self, cfg, mode="normal"):
         from control.dshinstall import DshInstaller
 
         me = pwd.getpwuid(os.getuid())
         account = Account("alice", me.pw_uid, me.pw_gid, (), "/home/alice", "/bin/bash")
         builder = supervisor.SpecBuilder(DshInstaller(Path("/opt/dsh"), Path("/tmp")), self.FakeHostNames())
-        return builder.build(cfg, User("alice", 20000, "k"), account, "/usr/bin/node", Layers(digest="d"))
+        return builder.build(cfg, User("alice", 20000, "k"), account, "/usr/bin/node", Layers(digest="d"), mode)
+
+    def test_recovery_runs_the_recovery_profile_from_dsh_home(self):
+        normal = self.build(parse())
+        recovery = self.build(parse(), mode="recovery")
+        self.assertEqual(normal.cwd, "/home/alice")
+        self.assertEqual(recovery.argv[2:4], ("--profile", managed.RECOVERY_PROFILE))
+        self.assertEqual(recovery.cwd, "/home/alice/.dsh")
+        self.assertTrue(recovery.provision.recovery)
+        self.assertNotEqual(normal, recovery, "switching modes must restart dsh")
 
     def test_runs_the_web_profile_with_policy_in_the_home_patch(self):
         spec = self.build(parse())
@@ -600,8 +683,10 @@ class FakeLauncher:
         self.stopped: list[FakeProc] = []
         self.fail_next = False
         self.output: list[str] | None = None
+        self.resets: list[bool] = []
 
-    def start(self, spec):
+    def start(self, spec, reset=False):
+        self.resets.append(reset)
         if self.fail_next:
             self.fail_next = False
             raise OSError("exec failed")
@@ -626,7 +711,7 @@ class SupervisorTest(unittest.TestCase):
 
     def spec(self, key: str = "k") -> supervisor.Spec:
         provision = Provision(account=self.account, env_block=managed.env_block(key), home_patch="", dsh=(), env=())
-        return supervisor.Spec(provision=provision, argv=("dsh",), layers="d")
+        return supervisor.Spec(provision=provision, argv=("dsh",), cwd="/tmp", layers="d")
 
     def settle(self) -> None:
         for inst in self.sup.instances.values():
@@ -642,7 +727,7 @@ class SupervisorTest(unittest.TestCase):
         self.sup.apply({"alice": self.spec()})
         self.sup.tick()
         self.settle()
-        self.assertEqual(self.sup.snapshot()["alice"], {"up": True, "token": "tok0", "error": None})
+        self.assertEqual(self.sup.snapshot()["alice"], {"up": True, "token": "tok0", "error": None, "mode": "normal"})
         self.assertTrue(self.changes.take())
 
     def test_crash_restarts_with_backoff(self):
@@ -663,7 +748,7 @@ class SupervisorTest(unittest.TestCase):
             self.sup.tick()
             self.settle()
             self.assertEqual(len(self.launcher.started), started + 1)
-        self.assertEqual(self.sup.snapshot()["alice"], {"up": True, "token": "tok3", "error": None})
+        self.assertEqual(self.sup.snapshot()["alice"], {"up": True, "token": "tok3", "error": None, "mode": "normal"})
 
     def test_crash_reports_dsh_error(self):
         self.launcher.output = [
@@ -687,6 +772,27 @@ class SupervisorTest(unittest.TestCase):
     def test_error_summary_without_error_line_keeps_the_tail(self):
         lines = [f"line {i}" for i in range(30)]
         self.assertEqual(supervisor.error_summary(lines).splitlines(), lines[-supervisor.ERROR_LINES:])
+
+    def test_restart_skips_backoff_and_can_reset_once(self):
+        self.sup.apply({"alice": self.spec()})
+        self.sup.tick()
+        self.settle()
+        self.launcher.started[-1].returncode = 1
+        self.now += 1
+        self.sup.tick()  # crashed: next start backs off
+        self.assertEqual(len(self.launcher.started), 1)
+        self.sup.restart("alice", reset=True)
+        self.assertIsNone(self.sup.snapshot()["alice"]["error"])
+        self.sup.tick()
+        self.settle()
+        self.assertEqual(len(self.launcher.started), 2, "restart starts at once")
+        self.sup.restart("alice")
+        self.assertEqual(self.launcher.stopped[-1], self.launcher.started[1], "restart stops the running dsh")
+        self.sup.tick()
+        self.assertEqual(self.launcher.resets, [False, True, False])
+        self.assertEqual(self.sup.snapshot()["alice"]["mode"], "normal")
+        with self.assertRaises(KeyError):
+            self.sup.restart("nobody")
 
     def test_exec_failure_backs_off(self):
         self.launcher.fail_next = True
@@ -718,9 +824,13 @@ class StateTest(unittest.TestCase):
     def test_render_and_write(self):
         cfg = parse()
         users = {"alice": User("alice", 20000, "k")}
-        payload = state.render(cfg, users, "sec", "/run/mu-dsh/auth.sock", {"alice": {"up": True, "token": "t", "error": None}})
-        self.assertEqual(payload["users"]["alice"], {"port": 20000, "llm_key": "k", "enabled": True, "up": True, "token": "t", "error": None})
-        self.assertEqual(payload["auth_socket"], "/run/mu-dsh/auth.sock")
+        status = {"alice": {"up": True, "token": "t", "error": None, "mode": "recovery"}}
+        payload = state.render(cfg, users, "sec", "/run/mu-dsh/control.sock", status)
+        self.assertEqual(
+            payload["users"]["alice"],
+            {"port": 20000, "llm_key": "k", "enabled": True, "up": True, "token": "t", "error": None, "mode": "recovery"},
+        )
+        self.assertEqual(payload["control_socket"], "/run/mu-dsh/control.sock")
         self.assertEqual(payload["relay"]["upstream"], "https://llm.example/v1")
         with tempfile.TemporaryDirectory() as d:
             state_file = StateFile(Path(d) / "gateway.json")

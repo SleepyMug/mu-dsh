@@ -1,10 +1,12 @@
-// The public gateway: login, logout, and per-user proxying under /u/<user>/.
+// The public gateway: login, logout, account and workspace actions, and
+// per-user proxying under /u/<user>/.
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { SESSION_COOKIE, stripCookie, type Passwords, type Sessions } from './auth.ts'
+import { SESSION_COOKIE, stripCookie, type Sessions } from './auth.ts'
+import type { Control, WorkspaceAction } from './control.ts'
 import type { Logger } from './log.ts'
-import { loginPage, messagePage, passwordPage, portalPage, startingPage } from './pages.ts'
+import { loginPage, messagePage, passwordPage, portalPage, resetPage, startingPage } from './pages.ts'
 import { forwardHeaders, type DshProxy, type ProxyTarget } from './proxy.ts'
 import type { StateSource } from './state.ts'
 
@@ -14,10 +16,12 @@ const MAX_FORM_BYTES = 16 * 1024
 export interface GatewayDeps {
   state: StateSource
   sessions: Sessions
-  passwords: Passwords
+  control: Control
   proxy: DshProxy
   log: Logger
 }
+
+const WORKSPACE_ACTIONS: readonly WorkspaceAction[] = ['restart', 'recover', 'reset']
 
 type Headers = Record<string, string | string[]>
 
@@ -52,7 +56,7 @@ function readForm(req: IncomingMessage): Promise<URLSearchParams> {
 /** Only follow `next` back into the signed-in user's own area or account pages. */
 function safeNext(next: string | null, user: string): string {
   const home = `/u/${user}/`
-  if (next === '/account/password') return next
+  if (next === '/account/password' || next === '/account/reset') return next
   return next !== null && next.startsWith(home) && !next.includes('\\') ? next : home
 }
 
@@ -66,14 +70,14 @@ type Deny = (status: number, title: string, message: string, location?: string) 
 export class Gateway {
   readonly state: StateSource
   readonly sessions: Sessions
-  readonly passwords: Passwords
+  readonly control: Control
   readonly proxy: DshProxy
   readonly log: Logger
 
   constructor(deps: GatewayDeps) {
     this.state = deps.state
     this.sessions = deps.sessions
-    this.passwords = deps.passwords
+    this.control = deps.control
     this.proxy = deps.proxy
     this.log = deps.log
   }
@@ -91,9 +95,15 @@ export class Gateway {
       const user = this.sessions.userFor(req)
       if (!user) return redirect(res, 302, '/login')
       const notice = url.searchParams.get('changed') === 'password' ? 'Your password was changed.' : undefined
-      return send(res, 200, portalPage(user, notice))
+      return send(res, 200, portalPage(user, { notice, mode: this.state.current.users[user]?.mode }))
     }
     if (path === '/account/password') return this.changePassword(req, res)
+    if (path === '/account/workspace') return this.workspace(req, res)
+    if (path === '/account/reset') {
+      const user = this.sessions.userFor(req)
+      if (!user) return redirect(res, 303, `/login?next=${encodeURIComponent('/account/reset')}`)
+      return send(res, 200, resetPage(user))
+    }
     if (path === '/login') {
       if (req.method === 'POST') return this.login(req, res)
       const user = this.sessions.userFor(req)
@@ -130,7 +140,7 @@ export class Gateway {
     const username = (form.get('username') ?? '').trim()
     const password = form.get('password') ?? ''
     const next = form.get('next')
-    const ok = await this.passwords.verify(username, password)
+    const ok = await this.control.verify(username, password)
     if (!ok || !this.state.current.users[username]?.enabled) {
       this.log.info(`gateway: failed login for ${JSON.stringify(username)}`)
       return send(res, 401, loginPage({ error: 'Wrong user name or password.', username, next: next ?? undefined }))
@@ -154,17 +164,42 @@ export class Gateway {
     }
     const next = form.get('new') ?? ''
     if (next !== (form.get('repeat') ?? '')) return send(res, 400, passwordPage(user, 'The new passwords do not match.'))
-    const error = await this.passwords.change(user, form.get('current') ?? '', next)
+    const error = await this.control.change(user, form.get('current') ?? '', next)
     if (error !== undefined) return send(res, 400, passwordPage(user, error))
     this.log.info(`gateway: ${user} changed their password`)
     redirect(res, 303, '/?changed=password')
+  }
+
+  /** Restart the signed-in user's dsh (normally, in recovery mode, or after a settings reset). */
+  private async workspace(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const user = this.sessions.userFor(req)
+    if (req.method !== 'POST' || !user) {
+      req.resume()
+      return redirect(res, 303, user ? '/' : '/login')
+    }
+    let form: URLSearchParams
+    try {
+      form = await readForm(req)
+    } catch {
+      return send(res, 413, messagePage('Request too large', 'The form was too large.'))
+    }
+    const action = form.get('action') as WorkspaceAction
+    if (!WORKSPACE_ACTIONS.includes(action)) return send(res, 400, messagePage('Unknown action', 'Nothing was changed.'))
+    const error = await this.control.workspace(user, action)
+    if (error !== undefined) return send(res, 503, messagePage('Not restarted', error))
+    this.log.info(`gateway: ${user} asked for ${action}`)
+    // The old dsh is stopped and gateway.json says so; read it now, not at the next poll.
+    this.state.refresh()
+    redirect(res, 303, `/u/${user}/`)
   }
 
   private proxyUser(req: IncomingMessage, res: ServerResponse, name: string, rest: string | undefined, url: URL): void {
     const target = this.authorize(req, name, rest, url, (status, title, message, location) => {
       req.resume()
       if (location !== undefined) return redirect(res, status, location)
-      if (status === 503 && isNavigation(req)) return send(res, 503, startingPage(name, message || null))
+      if (status === 503 && isNavigation(req)) {
+        return send(res, 503, startingPage(name, message || null, this.state.current.users[name]?.mode))
+      }
       if (!isNavigation(req)) {
         res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
         res.end(`${title}\n`)

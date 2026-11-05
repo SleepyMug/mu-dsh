@@ -33,8 +33,8 @@ class Paths:
         return self.run_dir / "gateway.json"
 
     @property
-    def auth_socket(self) -> Path:
-        return self.run_dir / "auth.sock"
+    def control_socket(self) -> Path:
+        return self.run_dir / "control.sock"
 
     @property
     def pid_file(self) -> Path:

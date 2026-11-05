@@ -1,8 +1,13 @@
 """``mu-dsh serve``: the long-running root service.
 
 SIGHUP re-reads config.toml and users.json and reconciles running processes;
-SIGTERM/SIGINT stop every user's dsh and exit. It also answers the gateway's
-password checks (authserver.py).
+SIGTERM/SIGINT stop every user's dsh and exit. It also serves the control
+socket (controlserver.py): password checks and changes for the gateway, and
+workspace actions (restart, recovery mode, settings reset), which it carries
+out here on the main loop.
+
+A user's recovery mode is kept in memory only: it lasts until they leave it,
+and a service restart starts everyone normally.
 """
 
 from __future__ import annotations
@@ -12,15 +17,16 @@ import signal
 
 from control import state
 from control.accounts import AccountError, Accounts
-from control.authserver import AuthServer
 from control.changes import Changes
 from control.config import Config, ConfigError, ConfigFile
+from control.controlserver import ControlServer
 from control.dshinstall import DshInstaller, InstallError, find_node
 from control.pidfile import PidFile
 from control.sitelayers import Layers, SiteLayers
 from control.state import SessionSecret, StateFile
 from control.supervisor import Spec, SpecBuilder, Supervisor
 from control.users import User, UserStore
+from control.workspace import NORMAL, RECOVER, RECOVERY, RESET, Request, WorkspaceRequests
 
 log = logging.getLogger("mu-dsh")
 
@@ -40,7 +46,8 @@ class Daemon:
         state_file: StateFile,
         session_secret: SessionSecret,
         pid_file: PidFile,
-        auth_server: AuthServer,
+        control_server: ControlServer,
+        workspaces: WorkspaceRequests,
     ):
         self.config_file = config_file
         self.users = users
@@ -53,10 +60,14 @@ class Daemon:
         self.state_file = state_file
         self.session_secret = session_secret
         self.pid_file = pid_file
-        self.auth_server = auth_server
+        self.control_server = control_server
+        self.workspaces = workspaces
 
         self.cfg: Config | None = None
+        self.node = ""
+        self.layers: Layers | None = None
         self.current_users: dict[str, User] = {}
+        self.modes: dict[str, str] = {}  # users not in NORMAL mode
         self.secret = ""
         self.reload_requested = False
         self.stop_requested = False
@@ -67,7 +78,7 @@ class Daemon:
         self.secret = self.session_secret.get()
         # Errors in the first load are fatal: systemd shows them and retries.
         # Serve password checks before publishing users the gateway could sign in.
-        self.auth_server.start(self.config_file.load().gateway.group)
+        self.control_server.start(self.config_file.load().gateway.group)
         self.reload()
         self.pid_file.write()
         try:
@@ -78,13 +89,15 @@ class Daemon:
                         self.reload()
                     except (ConfigError, InstallError) as e:
                         log.error("reload failed, keeping the previous configuration: %s", e)
+                for request in self.workspaces.take():
+                    self.carry_out(request)
                 self.supervisor.tick()
                 if self.changes.take():
                     self.publish()
                 self.changes.wait(0.5)
         finally:
             log.info("stopping all dsh instances")
-            self.auth_server.stop()
+            self.control_server.stop()
             self.supervisor.stop_all()
             if self.cfg is not None:
                 self.publish()
@@ -99,19 +112,36 @@ class Daemon:
             raise InstallError(f"dsh {cfg.dsh.version} is not installed; run `mu-dsh install-dsh`")
         users = self.users.load()
         layers = self.site_layers.write(cfg)
+        self.modes = {name: mode for name, mode in self.modes.items() if name in users and users[name].enabled}
         desired = self._desired_specs(cfg, users, node, layers)
-        self.cfg, self.current_users = cfg, users
+        self.cfg, self.current_users, self.node, self.layers = cfg, users, node, layers
         # Publish first so the gateway stops admitting removed or disabled users
         # before their processes are stopped.
         self.publish()
         self.supervisor.apply(desired)
         log.info("loaded configuration: %d managed users, %d enabled", len(users), len(desired))
 
+    def carry_out(self, request: Request) -> None:
+        """Restart a user's dsh, in recovery mode or after a settings reset as asked."""
+        name = request.user
+        if self.cfg is None or self.layers is None or name not in self.supervisor.instances:
+            return request.finish(f"{name}'s dsh is not managed by this service right now")
+        if request.action == RECOVER:
+            self.modes[name] = RECOVERY
+        else:
+            self.modes.pop(name, None)
+        log.info("%s: %s requested", name, request.action)
+        # A changed mode changes the spec, which apply() restarts; restart() covers the rest.
+        self.supervisor.apply(self._desired_specs(self.cfg, self.current_users, self.node, self.layers))
+        self.supervisor.restart(name, reset=request.action == RESET)
+        self.publish()
+        request.finish()
+
     def publish(self) -> None:
         """Write the current users and process status to gateway.json."""
         assert self.cfg is not None
         payload = state.render(
-            self.cfg, self.current_users, self.secret, str(self.auth_server.path), self.supervisor.snapshot()
+            self.cfg, self.current_users, self.secret, str(self.control_server.path), self.supervisor.snapshot()
         )
         self.state_file.write(payload, self.cfg.gateway.group)
 
@@ -125,7 +155,7 @@ class Daemon:
             except AccountError as e:
                 log.error("skipping managed user %s: %s", name, e)
                 continue
-            desired[name] = self.specs.build(cfg, user, account, node, layers)
+            desired[name] = self.specs.build(cfg, user, account, node, layers, self.modes.get(name, NORMAL))
         return desired
 
     def _on_signal(self, signum, _frame) -> None:

@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from control import managed
+from control import dshenv, managed
 from control.accounts import Account
 
 HELPER = Path(__file__).with_name("userfiles.py")
@@ -25,6 +25,7 @@ class Provision:
     home_patch: str
     dsh: tuple[str, ...]  # node and dsh's entry script
     env: tuple[tuple[str, str], ...]
+    recovery: bool = False
 
 
 class Provisioner:
@@ -35,7 +36,14 @@ class Provisioner:
         self.python = python
         self.helper = helper
 
-    def apply(self, p: Provision) -> None:
+    def apply(self, p: Provision, reset: bool = False) -> None:
+        """Prepare ~/.dsh for a start. ``reset`` first sets the user's web
+        profile settings aside; ``p.recovery`` rebuilds the recovery profile."""
+        if p.recovery:
+            recovery_dir = Path(p.account.dsh_home, "profiles", managed.RECOVERY_PROFILE)
+            self._run(p, ["rm", "-rf", "--", str(recovery_dir)], None, "clearing the recovery profile")
+            argv = [*p.dsh, "--profile", managed.RECOVERY_PROFILE, "--from-default-profile", managed.PROFILE, "--dump-default-config"]
+            self._run(p, argv, None, "creating the recovery profile")
         for profile in managed.PROFILES:
             if not Path(p.account.dsh_home, "profiles", profile, "package.json").exists():
                 # Let dsh create the profile from its own template; this only composes, it starts nothing.
@@ -50,6 +58,12 @@ class Provisioner:
             "patch_marker": managed.PATCH_MARKER,
             "bundle": managed.DEFAULTS_BUNDLE,
             "base_bundle": managed.BASE_BUNDLE,
+            "reset_profile": managed.PROFILE if reset else None,
+            # Recovery comments out user .env lines dsh would refuse to start with.
+            "refused_env": {
+                "names": sorted(dshenv.BOOTSTRAP_NAMES - dshenv.HOME_FILE_PROXY_NAMES),
+                "prefixes": list(dshenv.BOOTSTRAP_PREFIXES),
+            } if p.recovery else None,
         }
         self._run(p, [self.python, "-I", str(self.helper)], json.dumps(request), "provisioning")
 

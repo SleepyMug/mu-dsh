@@ -1,84 +1,10 @@
-// Password checks and changes (delegated to the root control plane) and
-// the gateway's own signed session cookie.
+// The gateway's own signed session cookie.
 
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
-import { createConnection } from 'node:net'
-import type { Logger } from './log.ts'
 import type { StateSource } from './state.ts'
 
 export const SESSION_COOKIE = 'mu_dsh_session'
-
-/** The user's Unix password, as far as the gateway can see it. */
-export interface Passwords {
-  verify(user: string, password: string): Promise<boolean>
-  /** Resolves to undefined on success, or a message to show the user. */
-  change(user: string, current: string, next: string): Promise<string | undefined>
-}
-
-interface AuthReply {
-  ok?: unknown
-  error?: unknown
-}
-
-/**
- * Asks the control plane over its Unix socket, which checks passwords through
- * PAM and changes them with chpasswd. One JSON line each way; any failure
- * counts as a refusal.
- */
-export class SocketPasswords implements Passwords {
-  readonly state: StateSource
-  readonly log: Logger
-  readonly timeoutMs: number
-
-  constructor(state: StateSource, log: Logger, timeoutMs = 15_000) {
-    this.state = state
-    this.log = log
-    this.timeoutMs = timeoutMs
-  }
-
-  async verify(user: string, password: string): Promise<boolean> {
-    return (await this.ask({ op: 'check', user, password }))?.ok === true
-  }
-
-  async change(user: string, current: string, next: string): Promise<string | undefined> {
-    const reply = await this.ask({ op: 'change_password', user, password: current, new_password: next })
-    if (reply?.ok === true) return undefined
-    return typeof reply?.error === 'string' ? reply.error : 'The password could not be changed.'
-  }
-
-  private ask(request: object): Promise<AuthReply | undefined> {
-    return new Promise((resolve) => {
-      const socket = createConnection(this.state.current.auth_socket)
-      let buffer = ''
-      const done = (reply: AuthReply | undefined) => {
-        socket.destroy()
-        resolve(reply)
-      }
-      socket.setEncoding('utf8')
-      socket.setTimeout(this.timeoutMs, () => {
-        this.log.error('gateway: password service timed out')
-        done(undefined)
-      })
-      socket.on('connect', () => socket.write(JSON.stringify(request) + '\n'))
-      socket.on('data', (chunk: string) => {
-        buffer += chunk
-        const newline = buffer.indexOf('\n')
-        if (newline === -1) return
-        try {
-          done(JSON.parse(buffer.slice(0, newline)) as AuthReply)
-        } catch {
-          done(undefined)
-        }
-      })
-      socket.on('error', (error) => {
-        this.log.error(`gateway: password service failed: ${error.message}`)
-        done(undefined)
-      })
-      socket.on('end', () => done(undefined))
-    })
-  }
-}
 
 function sign(secret: string, body: string): string {
   return createHmac('sha256', secret).update(body).digest('base64url')

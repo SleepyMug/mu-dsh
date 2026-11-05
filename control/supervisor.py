@@ -29,6 +29,7 @@ from control.hostnames import HostNames
 from control.provision import Provision, Provisioner
 from control.sitelayers import Layers
 from control.users import User
+from control.workspace import NORMAL, RECOVERY
 
 log = logging.getLogger("mu-dsh.supervisor")
 
@@ -50,7 +51,9 @@ class Spec:
 
     provision: Provision
     argv: tuple[str, ...]
+    cwd: str
     layers: str  # digest of the shared defaults, so changing them restarts every user
+    mode: str = NORMAL
 
     @property
     def account(self) -> Account:
@@ -68,7 +71,10 @@ class SpecBuilder:
         self.installer = installer
         self.hostnames = hostnames
 
-    def build(self, cfg: Config, user: User, account: Account, node: str, layers: Layers) -> Spec:
+    def build(self, cfg: Config, user: User, account: Account, node: str, layers: Layers, mode: str = NORMAL) -> Spec:
+        """``mode`` RECOVERY runs the recovery profile, started in ~/.dsh so that a
+        ~/.env the user keeps for their own projects is not read either."""
+        recovery = mode == RECOVERY
         # dsh refuses requests whose Host is not loopback or a trusted host, so it must
         # trust what browsers type: the public URL's host, or else any of our own names.
         if cfg.gateway.public_url:
@@ -78,7 +84,7 @@ class SpecBuilder:
         dsh = (node, str(self.installer.entry_script(cfg.dsh.version)))
         argv = (
             *dsh,
-            "--profile", managed.PROFILE,
+            "--profile", managed.RECOVERY_PROFILE if recovery else managed.PROFILE,
             "--no-open",
             "--host", "127.0.0.1",
             "--port", str(user.port),
@@ -94,8 +100,10 @@ class SpecBuilder:
             home_patch=managed.policy_text(),
             dsh=dsh,
             env=tuple(sorted(env.items())),
+            recovery=recovery,
         )
-        return Spec(provision=provision, argv=argv, layers=layers.digest)
+        cwd = account.dsh_home if recovery else account.home
+        return Spec(provision=provision, argv=argv, cwd=cwd, layers=layers.digest, mode=mode)
 
 
 def token_from_line(line: str) -> str | None:
@@ -112,12 +120,12 @@ class Launcher:
     def __init__(self, provisioner: Provisioner):
         self.provisioner = provisioner
 
-    def start(self, spec: Spec) -> subprocess.Popen:
-        self.provisioner.apply(spec.provision)
+    def start(self, spec: Spec, reset: bool = False) -> subprocess.Popen:
+        self.provisioner.apply(spec.provision, reset=reset)
         return subprocess.Popen(
             list(spec.argv),
             env=dict(spec.env),
-            cwd=spec.account.home,
+            cwd=spec.cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -155,6 +163,7 @@ class Instance:
     failures: int = 0
     next_start: float = 0.0
     last_error: str | None = None
+    reset_next: bool = False  # set the profile settings aside before the next start
     output: deque = field(default_factory=lambda: deque(maxlen=OUTPUT_KEPT), repr=False)
     reader: threading.Thread | None = field(default=None, repr=False)
 
@@ -220,6 +229,19 @@ class Supervisor:
             if inst.proc is None and now >= inst.next_start:
                 self._start(inst)
 
+    def restart(self, name: str, reset: bool = False) -> None:
+        """Stop the user's dsh now and start it again on the next tick, skipping
+        any backoff. ``reset`` sets their profile settings aside first."""
+        inst = self.instances.get(name)
+        if inst is None:
+            raise KeyError(name)
+        self._stop(inst)
+        inst.failures = 0
+        inst.next_start = 0.0
+        inst.reset_next = inst.reset_next or reset
+        inst.last_error = None
+        self.changes.mark()
+
     def stop_all(self) -> None:
         self.launcher.stop([i.proc for i in self.instances.values() if i.proc is not None])
         with self.lock:
@@ -230,13 +252,19 @@ class Supervisor:
     def snapshot(self) -> dict[str, dict]:
         with self.lock:
             return {
-                name: {"up": inst.up, "token": inst.token if inst.up else None, "error": inst.last_error}
+                name: {
+                    "up": inst.up,
+                    "token": inst.token if inst.up else None,
+                    "error": inst.last_error,
+                    "mode": inst.spec.mode,
+                }
                 for name, inst in self.instances.items()
             }
 
     def _start(self, inst: Instance) -> None:
         try:
-            proc = self.launcher.start(inst.spec)
+            proc = self.launcher.start(inst.spec, reset=inst.reset_next)
+            inst.reset_next = False
         except Exception as e:  # provisioning or exec failure: back off and retry
             inst.failures += 1
             delay = _backoff(inst.failures)

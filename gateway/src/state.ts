@@ -12,6 +12,7 @@ export interface UserState {
   up: boolean
   token: string | null
   error: string | null
+  mode: 'normal' | 'recovery'
 }
 
 export interface GatewayState {
@@ -23,8 +24,8 @@ export interface GatewayState {
     session_max_age_days: number
   }
   session_secret: string
-  /** The control plane's password-check socket (see control/authserver.py). */
-  auth_socket: string
+  /** The control plane's socket (see control/controlserver.py). */
+  control_socket: string
   relay: {
     listen_host: string
     listen_port: number
@@ -39,6 +40,8 @@ export interface StateSource {
   readonly current: GatewayState
   /** The enabled user owning a relay key, if any. */
   userForKey(key: string): string | undefined
+  /** Pick up a change the control plane just made, without waiting for the next poll. */
+  refresh(): void
 }
 
 export function parseState(text: string): GatewayState {
@@ -76,6 +79,8 @@ export class MemoryState implements StateSource {
     const name = this.#byKey.get(key)
     return name !== undefined && this.#state?.users[name]?.enabled ? name : undefined
   }
+
+  refresh(): void {}
 }
 
 /** gateway.json on disk, re-read whenever the control plane replaces it. */
@@ -100,6 +105,10 @@ export class StateFile extends MemoryState {
     }
     this.set(next)
     return true
+  }
+
+  override refresh(): void {
+    this.reload()
   }
 
   watch(onChange: (state: GatewayState) => void, intervalMs = 500): () => void {
