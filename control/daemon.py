@@ -22,7 +22,7 @@ from control.config import Config, ConfigError, ConfigFile
 from control.controlserver import ControlServer
 from control.dshinstall import DshInstaller, InstallError, find_node
 from control.pidfile import PidFile
-from control.sitelayers import Layers, SiteLayers
+from control.sitelayers import Layers, SiteLayerError, SiteLayers
 from control.state import SessionSecret, StateFile
 from control.supervisor import Spec, SpecBuilder, Supervisor
 from control.users import User, UserStore
@@ -87,7 +87,7 @@ class Daemon:
                     self.reload_requested = False
                     try:
                         self.reload()
-                    except (ConfigError, InstallError) as e:
+                    except (ConfigError, InstallError, SiteLayerError) as e:
                         log.error("reload failed, keeping the previous configuration: %s", e)
                 for request in self.workspaces.take():
                     self.carry_out(request)

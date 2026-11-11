@@ -69,6 +69,8 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
    - **Restart workspace** — e.g. after editing `~/.dsh/.env`.
    - **Start in recovery mode** — dsh without their own settings, plugins and `~/.env`, to fix them; **Leave recovery mode** returns.
    - **Reset my settings…** — sets `~/.dsh/profiles/web/cordis.patch.yml` aside as `.bak-<time>` and restarts.
+5. In dsh, a link to a folder (in a reply, or anywhere dsh opens files) opens a folder view in the
+   right sidebar; files and folders have download buttons (folders as ZIP). See "Folder view and downloads".
 
 ## Components
 
@@ -76,6 +78,7 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 |---|---|---|---|
 | `control/` → `mu-dsh` | Python 3.11+, stdlib only | root | CLI, Unix accounts, provisioning, dsh install, supervising one dsh per user, PAM password checks |
 | `gateway/` | TypeScript on Node ≥ 23.6, no runtime dependencies | `mu-dsh` | login, per-user reverse proxy (HTTP + WebSocket), LLM relay |
+| `plugin/` → `mu-dsh-files` | TypeScript, a dsh plugin (built output in `plugin/lib/` is committed) | in each user's dsh and browser | folder view and downloads in dsh's web UI |
 
 They share two things in `/run/mu-dsh`: `gateway.json` (users and process state,
 format in `control/state.py`), written by the Python side and watched by the
@@ -124,7 +127,7 @@ can override and a thin layer of policy they cannot. dsh composes, lowest first:
 | Layer | Written by | Contents |
 |---|---|---|
 | dsh's own bundles (`dsh-base`, `dsh-web-app`, …) | dsh | shipped defaults |
-| `mu-dsh-defaults` bundle (`/opt/mu-dsh/dsh/node_modules/`) | mu-dsh, shared, root-owned | the relay as the model provider, the default model |
+| `mu-dsh-defaults` bundle (`/opt/mu-dsh/dsh/node_modules/`) | mu-dsh, shared, root-owned | the relay as the model provider, the default model, the `mu-dsh-files` plugin |
 | `~/.dsh/profiles/<profile>/cordis.patch.yml` | the user, dsh's settings UI | anything, including other models or providers |
 | `~/.dsh/cordis.patch.yml` (home-level) | mu-dsh, rewritten each start | policy: web search off, telemetry off |
 
@@ -156,6 +159,47 @@ file is fixed. From there (or from `/`) the user can:
   to `cordis.patch.yml.bak-<ms>` and replaced by an empty one; installed plugins
   stay installed.
 * **Restart workspace**, which also skips the retry backoff.
+
+### Folder view and downloads
+
+`plugin/` is a dsh plugin, `mu-dsh-files`, which the defaults bundle mounts
+(the bundle lists it as a dependency, so dsh resolves it next to the bundle).
+It changes nothing in dsh itself; it uses the extension points dsh's web
+client has:
+
+* **Folder view.** In dsh's right sidebar every file address goes to one tab
+  type, chosen before anything can know whether the path is a file or a
+  folder. mu-dsh-files registers a tab type at the highest rank for all of
+  them; each such tab first asks the host what its path is. A directory stays
+  and is shown as a tree (expand folders inline, open files, go up a level,
+  reload). Anything else, including a missing path, is reopened in the tab's
+  place with the viewer dsh would otherwise have used, keeping the line a
+  link points at; repeated links reuse open tabs as before. The cost is one
+  small request before every file opens.
+* **Downloads.** A button in dsh's file preview header and in its "cannot
+  preview" state, on every row and the header of the folder view, and on the
+  Files tree header (the whole workspace). Folders download as a ZIP archive
+  named after them. The button asks first, so a refusal (dsh may not read a
+  file, a folder over 65,535 entries or 2 GiB) is said next to it, naming the
+  path; then the browser streams the download to disk.
+
+The host half adds two routes to dsh's `/api` (`mu-dsh-files.entry`,
+`mu-dsh-files.download`). dsh authenticates them like its own, and they read
+through dsh's filesystem service, so they reach exactly what the user's dsh
+may read, as the user.
+
+The plugin uses dsh's internal web client APIs, so a dsh upgrade can break it.
+It is built so that this costs only its own features: its parts wait for the
+dsh services they use and register as one unit, and if any part fails, dsh
+starts without them (its preview, links and Files tree work as without the
+plugin) and the browser console says why. A user can turn it off for
+themselves with a row in their profile patch: `- id: mu-dsh-files` /
+`disabled: true`.
+
+To change it: edit `plugin/src`, then `cd plugin && pnpm install && pnpm run
+typecheck && pnpm test && pnpm run build`, and commit `plugin/lib` with the
+sources. `install.sh` copies `plugin/package.json` and `plugin/lib`; nothing
+is built on the server.
 
 ### How sign-in works
 
@@ -196,9 +240,10 @@ also deletes every managed user's account and home directory.
 
 | Path | Contents |
 |---|---|
-| `/opt/mu-dsh/{control,gateway}` | code |
+| `/opt/mu-dsh/{control,gateway,plugin}` | code |
 | `/opt/mu-dsh/dsh/versions/<v>`, `current` | pinned dsh installs (current + previous kept) |
 | `/opt/mu-dsh/dsh/node_modules/mu-dsh-defaults` | generated defaults bundle (provider, default model) |
+| `/opt/mu-dsh/dsh/node_modules/mu-dsh-files` | the plugin, copied from `/opt/mu-dsh/plugin` |
 | `/etc/mu-dsh/config.toml` | configuration (0600; holds the upstream key) |
 | `/var/lib/mu-dsh/users.json`, `session-secret` | managed users, ports, relay keys |
 | `/run/mu-dsh/gateway.json`, `control.sock` | control plane ↔ gateway (root:mu-dsh) |
@@ -235,6 +280,8 @@ prefixed with its user; relay requests are logged per user).
 ```sh
 python3 -m unittest discover -s tests/unit      # control plane (host)
 cd gateway && node --test test/                 # gateway (host)
+cd plugin && node --test test/                  # dsh plugin routes and folder logic (host)
+cd plugin && node build.mjs --check             # plugin/lib matches plugin/src (after pnpm install)
 python3 tests/vm/vm.py test                     # full system tests in a QEMU VM
 ```
 
@@ -247,7 +294,8 @@ the pinned dsh version changes. Every run then boots the base image with QEMU
 `-snapshot`, so each run starts from the same clean state and nothing is written
 back. The suite installs mu-dsh with `install.sh`, starts a fake OpenAI-compatible
 upstream in the VM (`tests/vm/fake_llm.py`), and checks provisioning, sign-in,
-isolation, WebSockets, the relay, a real `dsh headless` model call, crash
+isolation, WebSockets, the relay, a real `dsh headless` model call, the
+plugin's routes and browser code through the gateway, crash
 recovery, user settings overriding defaults but not policy, a broken user
 configuration shown on the Starting page, Unix password changes and locked accounts, reloads, a reboot, account
 deletion, and uninstall.
@@ -260,7 +308,9 @@ python3 tests/vm/vm.py down
 python3 tests/vm/vm.py build-base --force       # rebuild the base image
 ```
 
-For type-checking the gateway: `cd gateway && npm install && npm run typecheck`.
+For type-checking the gateway: `cd gateway && npm install && npm run typecheck`;
+the plugin: `cd plugin && pnpm install && pnpm run typecheck` (its dev dependencies
+pin dsh's packages at the version in `packaging/config.example.toml`).
 
 ## Known limitations
 
@@ -278,3 +328,9 @@ For type-checking the gateway: `cd gateway && npm install && npm run typecheck`.
 * A profile the user creates later gets the defaults bundle the next time
   their dsh is started by mu-dsh.
 * All enabled users' dsh instances start at boot (one Node process each).
+* mu-dsh-files is built and tested against the pinned dsh version. After
+  changing `[dsh] version`, check the folder view; if dsh's client API moved,
+  the plugin's features are missing (dsh itself is unaffected) until it is
+  updated.
+* The folder view lists a folder when it is opened, expanded or reloaded; it
+  does not watch for changes as dsh's Files tree does.

@@ -24,7 +24,7 @@ from control.admin import UserAdmin  # noqa: E402
 from control.controlserver import ControlServer  # noqa: E402
 from control.changes import Changes  # noqa: E402
 from control.provision import Provision, Provisioner  # noqa: E402
-from control.sitelayers import Layers, SiteLayers  # noqa: E402
+from control.sitelayers import Layers, SiteLayerError, SiteLayers  # noqa: E402
 from control.state import SessionSecret, StateFile  # noqa: E402
 from control.users import User, UserError, UserStore, allocate_port  # noqa: E402
 from control.workspace import WorkspaceRequests  # noqa: E402
@@ -146,8 +146,9 @@ class ManagedTest(unittest.TestCase):
         self.assertEqual(provider["compat"], {"thinkingFormat": "qwen"})
         self.assertEqual(parsed[1]["config"], {"provider": "mu-dsh", "model": "big"})
         self.assertEqual(parse_yaml(managed.policy_text()), managed.policy_entries())
-        bundle = json.loads(managed.bundle_manifest())
+        bundle = json.loads(managed.bundle_manifest("1.2.3"))
         self.assertEqual(bundle["dsh"], {"bundle": {"patch": "cordis.patch.yml"}})
+        self.assertEqual(bundle["dependencies"], {"mu-dsh-files": "1.2.3"})
 
     @unittest.skipUnless(shutil.which("node"), "needs node")
     def test_env_block_parses_like_node(self):
@@ -594,19 +595,55 @@ class SiteLayersTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root.parent)
 
+    def sites(self, plugin: Path = ROOT / "plugin") -> SiteLayers:
+        return SiteLayers(self.root, plugin)
+
     def test_writes_bundle(self):
-        SiteLayers(self.root).write(parse())
+        self.sites().write(parse())
         bundle = self.root / "node_modules" / "mu-dsh-defaults"
         self.assertEqual(json.loads((bundle / "package.json").read_text())["name"], "mu-dsh-defaults")
         self.assertEqual((bundle / "cordis.patch.yml").read_text(), managed.defaults_text(parse()))
         for path in (self.root, bundle.parent, bundle, bundle / "package.json", bundle / "cordis.patch.yml"):
             self.assertTrue(os.stat(path).st_mode & 0o004, f"{path} must be world-readable")
 
+    def test_installs_the_plugin_the_bundle_mounts(self):
+        self.sites().write(parse())
+        plugin = self.root / "node_modules" / "mu-dsh-files"
+        manifest = json.loads((plugin / "package.json").read_text())
+        self.assertEqual(manifest["name"], "mu-dsh-files")
+        self.assertIn("client", manifest["dsh"])
+        for name in ("lib/index.js", "lib/client.js"):
+            self.assertEqual((plugin / name).read_text(), (ROOT / "plugin" / name).read_text())
+            self.assertTrue(os.stat(plugin / name).st_mode & 0o004)
+        rows = parse_yaml(managed.defaults_text(parse()))
+        self.assertIn({"insert": [{"id": "mu-dsh-files", "name": "mu-dsh-files"}]}, rows)
+        bundle = json.loads((self.root / "node_modules" / "mu-dsh-defaults" / "package.json").read_text())
+        self.assertEqual(bundle["dependencies"], {"mu-dsh-files": manifest["version"]})
+
+    def test_removes_files_an_older_plugin_had(self):
+        stale = self.root / "node_modules" / "mu-dsh-files" / "lib" / "old" / "chunk.js"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("old")
+        self.sites().write(parse())
+        self.assertFalse(stale.parent.exists())
+        self.assertTrue((self.root / "node_modules" / "mu-dsh-files" / "lib" / "client.js").exists())
+
+    def test_refuses_without_the_built_plugin(self):
+        with self.assertRaisesRegex(SiteLayerError, "no-plugin/package.json is missing"):
+            self.sites(self.root.parent / "no-plugin").write(parse())
+
     def test_digest_follows_content(self):
-        sites = SiteLayers(self.root)
+        sites = self.sites()
         first = sites.write(parse()).digest
         self.assertEqual(sites.write(parse()).digest, first)
         self.assertNotEqual(sites.write(parse(CONFIG.replace('default_model = "big"', 'default_model = "small"'))).digest, first)
+
+    def test_digest_follows_the_plugin(self):
+        plugin = self.root.parent / "plugin"
+        shutil.copytree(ROOT / "plugin", plugin, ignore=shutil.ignore_patterns("node_modules", "src", "test"))
+        first = self.sites(plugin).write(parse()).digest
+        (plugin / "lib" / "client.js").write_text("changed")
+        self.assertNotEqual(self.sites(plugin).write(parse()).digest, first)
 
 
 class SpecBuilderTest(unittest.TestCase):

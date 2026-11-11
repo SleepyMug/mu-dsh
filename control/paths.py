@@ -15,6 +15,7 @@ class Paths:
     run_dir: Path  # gateway.json, pid file
     dsh_root: Path  # pinned dsh installs: versions/<v>, current -> versions/<v>
     npm_cache: Path
+    plugin_source: Path  # the built mu-dsh-files plugin install.sh copies from plugin/
 
     @property
     def users_file(self) -> Path:
@@ -49,4 +50,5 @@ class Paths:
             run_dir=Path(env.get("MU_DSH_RUN_DIR", "/run/mu-dsh")),
             dsh_root=Path(env.get("MU_DSH_DSH_ROOT", "/opt/mu-dsh/dsh")),
             npm_cache=Path(env.get("MU_DSH_NPM_CACHE", "/var/cache/mu-dsh/npm")),
+            plugin_source=Path(env.get("MU_DSH_PLUGIN_DIR", "/opt/mu-dsh/plugin")),
         )

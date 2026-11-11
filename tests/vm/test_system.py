@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import socket
 import sys
 import time
 import unittest
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -442,6 +444,53 @@ class SystemTest(unittest.TestCase):
         self.assertEqual(requests[0]["model"], "test-model")
         log = self.sh("journalctl --no-pager -u mu-dsh-gateway | grep 'relay: user=alice POST /v1/chat/completions'", check=False)
         self.assertTrue(log.stdout, "relay did not log alice's request")
+
+    def test_11a_files_plugin(self):
+        # Installed next to dsh as a dependency of the defaults bundle, which mounts it.
+        plugin = "/opt/mu-dsh/dsh/node_modules/mu-dsh-files"
+        self.assertEqual(self.sh(f"stat -c '%U %a' {plugin}/lib/client.js").stdout.split(), ["root", "644"])
+        bundle = json.loads(self.sh("cat /opt/mu-dsh/dsh/node_modules/mu-dsh-defaults/package.json").stdout)
+        self.assertEqual(bundle["dependencies"], {"mu-dsh-files": json.loads(self.sh(f"cat {plugin}/package.json").stdout)["version"]})
+        self.assertRegex(self.sh("runuser -l alice -c 'dsh --profile web --dump-config'").stdout, r"- id: mu-dsh-files\n\s+name: mu-dsh-files")
+
+        b = self.signed_in("alice")
+        # The web client loads the browser half.
+        html = b.get("/u/alice/").body.decode()
+        script = re.search(r'\{"id":"mu-dsh-files","url":"([^"]+)"', html)
+        self.assertIsNotNone(script, "the page's plugin graph has no mu-dsh-files")
+        client = b.get("/u/alice/" + script.group(1))
+        self.assertEqual(client.status, 200)
+        self.assertIn(b'window.__ModuleLoader__.load({\n\tid: "mu-dsh-files"', client.body)
+
+        # The host half's routes, through the gateway, reading as alice.
+        self.sh("runuser -u alice -- sh -c 'mkdir -p ~/results/sub ~/results/empty && printf alpha > ~/results/a.txt && printf beta > ~/results/sub/b.txt'")
+        api = "/u/alice/api/mu-dsh-files"
+        listing = b.get(f"{api}.entry?path=/home/alice/results")
+        self.assertEqual(listing.status, 200, listing.body)
+        entry = json.loads(listing.body)
+        self.assertEqual((entry["type"], entry["path"]), ("directory", "/home/alice/results"))
+        self.assertEqual(sorted((e["name"], e["type"]) for e in entry["entries"]),
+                         [("a.txt", "file"), ("empty", "directory"), ("sub", "directory")])
+        self.assertEqual(json.loads(b.get(f"{api}.entry?path=/home/alice/results/a.txt").body), {"type": "file", "path": "/home/alice/results/a.txt", "size": 5})
+
+        file = b.get(f"{api}.download?path=/home/alice/results/a.txt")
+        self.assertEqual((file.status, file.body), (200, b"alpha"))
+        self.assertTrue(file.header("content-disposition").startswith('attachment; filename="a.txt"'))
+        archive = b.get(f"{api}.download?path=/home/alice/results")
+        self.assertEqual(archive.status, 200)
+        self.assertEqual(archive.header("content-type"), "application/zip")
+        with zipfile.ZipFile(io.BytesIO(archive.body)) as z:
+            self.assertIsNone(z.testzip())
+            self.assertEqual(sorted(z.namelist()), ["results/a.txt", "results/empty/", "results/sub/b.txt"])
+            self.assertEqual(z.read("results/sub/b.txt"), b"beta")
+
+        # dsh reads only what alice may: bob's files are refused, by name even to HEAD.
+        self.assertEqual(b.get(f"{api}.download?path=/home/bob/.dsh/.env").status, 403)
+        head = b.request("HEAD", f"{api}.download?path=/home/bob/.dsh")
+        self.assertEqual(head.status, 403)
+        self.assertIn("bob", head.header("x-mu-dsh-refusal") or "")
+        # And bob cannot reach alice's routes at all.
+        self.assertEqual(self.signed_in("bob").get(f"{api}.entry?path=/home/alice").status, 403)
 
     def test_12_crash_recovery(self):
         b = self.signed_in("alice")

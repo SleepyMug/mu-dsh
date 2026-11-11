@@ -80,14 +80,18 @@ fi
 # --- code ----------------------------------------------------------------------
 say "installing code into $PREFIX"
 install -d -m 0755 "$PREFIX" "$PREFIX/gateway"
-rm -rf "$PREFIX/control" "$PREFIX/gateway/src"
+rm -rf "$PREFIX/control" "$PREFIX/gateway/src" "$PREFIX/plugin"
 cp -R "$SRC/control" "$PREFIX/control"
 cp -R "$SRC/gateway/src" "$PREFIX/gateway/src"
 cp "$SRC/gateway/package.json" "$PREFIX/gateway/package.json"
+# The dsh plugin, built (plugin/lib is committed); the daemon copies it next to dsh.
+install -d -m 0755 "$PREFIX/plugin" "$PREFIX/plugin/lib"
+cp "$SRC/plugin/package.json" "$PREFIX/plugin/package.json"
+cp "$SRC/plugin/lib/index.js" "$SRC/plugin/lib/client.js" "$PREFIX/plugin/lib/"
 cp "$SRC/README.md" "$PREFIX/README.md" 2>/dev/null || true
 find "$PREFIX/control" -name __pycache__ -prune -exec rm -rf {} +
-chown -R root:root "$PREFIX/control" "$PREFIX/gateway"
-chmod -R u=rwX,go=rX "$PREFIX/control" "$PREFIX/gateway"
+chown -R root:root "$PREFIX/control" "$PREFIX/gateway" "$PREFIX/plugin"
+chmod -R u=rwX,go=rX "$PREFIX/control" "$PREFIX/gateway" "$PREFIX/plugin"
 
 cat > "$BIN/mu-dsh" <<EOF
 #!/bin/sh

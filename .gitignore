@@ -3,3 +3,4 @@ __pycache__/
 /tests/vm/.cache/
 /gateway/node_modules/
 .pytest_cache/
+/plugin/node_modules/
