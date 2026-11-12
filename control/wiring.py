@@ -70,7 +70,7 @@ def build_daemon(services: Services) -> Daemon:
         users=services.users,
         accounts=services.accounts,
         installer=services.installer,
-        site_layers=SiteLayers(services.paths.dsh_root, services.paths.plugin_source),
+        site_layers=SiteLayers(services.paths.dsh_root, services.paths.plugins_source),
         specs=SpecBuilder(services.installer, HostNames()),
         supervisor=Supervisor(Launcher(services.provisioner), changes),
         changes=changes,

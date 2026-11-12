@@ -138,17 +138,20 @@ class ConfigTest(unittest.TestCase):
 class ManagedTest(unittest.TestCase):
     def test_layers_are_valid_yaml_for_node(self):
         """dsh parses patches with js-yaml; the emitted YAML must round-trip through a real parser."""
-        parsed = parse_yaml(managed.defaults_text(parse()))
-        self.assertEqual(parsed, managed.defaults_entries(parse()))
+        plugins = ["mu-dsh-files", "@site/extra"]
+        parsed = parse_yaml(managed.defaults_text(parse(), plugins))
+        self.assertEqual(parsed, managed.defaults_entries(parse(), plugins))
+        self.assertEqual(parsed[2], {"insert": [{"id": "mu-dsh-files", "name": "mu-dsh-files"}, {"id": "@site/extra", "name": "@site/extra"}]})
+        self.assertEqual(len(managed.defaults_entries(parse())), 2, "no plugins, no insert row")
         provider = parsed[0]["config"]["providers"]["mu-dsh"]
         self.assertEqual(provider["baseURL"], "http://127.0.0.1:8401/v1")
         self.assertEqual(provider["apiKeyEnv"], "MUDSH_LLM_KEY")
         self.assertEqual(provider["compat"], {"thinkingFormat": "qwen"})
         self.assertEqual(parsed[1]["config"], {"provider": "mu-dsh", "model": "big"})
         self.assertEqual(parse_yaml(managed.policy_text()), managed.policy_entries())
-        bundle = json.loads(managed.bundle_manifest("1.2.3"))
+        bundle = json.loads(managed.bundle_manifest({"mu-dsh-files": "1.2.3", "@site/extra": "0.1.0"}))
         self.assertEqual(bundle["dsh"], {"bundle": {"patch": "cordis.patch.yml"}})
-        self.assertEqual(bundle["dependencies"], {"mu-dsh-files": "1.2.3"})
+        self.assertEqual(bundle["dependencies"], {"mu-dsh-files": "1.2.3", "@site/extra": "0.1.0"})
 
     @unittest.skipUnless(shutil.which("node"), "needs node")
     def test_env_block_parses_like_node(self):
@@ -588,37 +591,61 @@ class UserFilesTest(unittest.TestCase):
 
 
 class SiteLayersTest(unittest.TestCase):
+    """The plugins come from a copy of the source tree's plugins/, as install.sh makes it."""
+
+    FILES = ROOT / "plugins" / "mu-dsh-files"
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp()) / "dsh"
         self.root.mkdir()
+        self.plugins = self.root.parent / "plugins"
+        self.install(self.FILES)
 
     def tearDown(self):
         shutil.rmtree(self.root.parent)
 
-    def sites(self, plugin: Path = ROOT / "plugin") -> SiteLayers:
-        return SiteLayers(self.root, plugin)
+    def install(self, source: Path, as_dir: str | None = None) -> Path:
+        target = self.plugins / (as_dir or source.name)
+        target.mkdir(parents=True)
+        shutil.copy(source / "package.json", target / "package.json")
+        shutil.copytree(source / "lib", target / "lib")
+        return target
+
+    def fake_plugin(self, directory: str, name: str, version: str = "0.1.0") -> Path:
+        target = self.plugins / directory
+        (target / "lib").mkdir(parents=True)
+        (target / "package.json").write_text(json.dumps({"name": name, "version": version}))
+        (target / "lib" / "index.js").write_text(f"export const name = {json.dumps(name)}\n")
+        return target
+
+    def sites(self) -> SiteLayers:
+        return SiteLayers(self.root, self.plugins)
+
+    def bundle(self) -> dict:
+        return json.loads((self.root / "node_modules" / "mu-dsh-defaults" / "package.json").read_text())
 
     def test_writes_bundle(self):
         self.sites().write(parse())
         bundle = self.root / "node_modules" / "mu-dsh-defaults"
-        self.assertEqual(json.loads((bundle / "package.json").read_text())["name"], "mu-dsh-defaults")
-        self.assertEqual((bundle / "cordis.patch.yml").read_text(), managed.defaults_text(parse()))
+        self.assertEqual(self.bundle()["name"], "mu-dsh-defaults")
+        self.assertEqual((bundle / "cordis.patch.yml").read_text(), managed.defaults_text(parse(), ["mu-dsh-files"]))
         for path in (self.root, bundle.parent, bundle, bundle / "package.json", bundle / "cordis.patch.yml"):
             self.assertTrue(os.stat(path).st_mode & 0o004, f"{path} must be world-readable")
 
-    def test_installs_the_plugin_the_bundle_mounts(self):
+    def test_installs_the_plugins_the_bundle_mounts(self):
+        self.fake_plugin("extra", "@site/extra", "2.0.0")
         self.sites().write(parse())
         plugin = self.root / "node_modules" / "mu-dsh-files"
         manifest = json.loads((plugin / "package.json").read_text())
         self.assertEqual(manifest["name"], "mu-dsh-files")
         self.assertIn("client", manifest["dsh"])
         for name in ("lib/index.js", "lib/client.js"):
-            self.assertEqual((plugin / name).read_text(), (ROOT / "plugin" / name).read_text())
+            self.assertEqual((plugin / name).read_text(), (self.FILES / name).read_text())
             self.assertTrue(os.stat(plugin / name).st_mode & 0o004)
-        rows = parse_yaml(managed.defaults_text(parse()))
-        self.assertIn({"insert": [{"id": "mu-dsh-files", "name": "mu-dsh-files"}]}, rows)
-        bundle = json.loads((self.root / "node_modules" / "mu-dsh-defaults" / "package.json").read_text())
-        self.assertEqual(bundle["dependencies"], {"mu-dsh-files": manifest["version"]})
+        self.assertTrue((self.root / "node_modules" / "@site" / "extra" / "lib" / "index.js").is_file())
+        rows = parse_yaml((self.root / "node_modules" / "mu-dsh-defaults" / "cordis.patch.yml").read_text())
+        self.assertIn({"insert": [{"id": "@site/extra", "name": "@site/extra"}, {"id": "mu-dsh-files", "name": "mu-dsh-files"}]}, rows)
+        self.assertEqual(self.bundle()["dependencies"], {"@site/extra": "2.0.0", "mu-dsh-files": manifest["version"]})
 
     def test_removes_files_an_older_plugin_had(self):
         stale = self.root / "node_modules" / "mu-dsh-files" / "lib" / "old" / "chunk.js"
@@ -628,9 +655,48 @@ class SiteLayersTest(unittest.TestCase):
         self.assertFalse(stale.parent.exists())
         self.assertTrue((self.root / "node_modules" / "mu-dsh-files" / "lib" / "client.js").exists())
 
-    def test_refuses_without_the_built_plugin(self):
-        with self.assertRaisesRegex(SiteLayerError, "no-plugin/package.json is missing"):
-            self.sites(self.root.parent / "no-plugin").write(parse())
+    def test_removes_a_plugin_no_longer_shipped_and_nothing_else(self):
+        extra = self.fake_plugin("extra", "@site/extra")
+        self.sites().write(parse())
+        foreign = self.root / "node_modules" / "not-ours"
+        foreign.mkdir()
+        shutil.rmtree(extra)
+        self.sites().write(parse())
+        self.assertFalse((self.root / "node_modules" / "@site").exists())
+        self.assertTrue(foreign.is_dir(), "a package mu-dsh did not install stays")
+        self.assertEqual(self.bundle()["dependencies"], {"mu-dsh-files": json.loads((self.FILES / "package.json").read_text())["version"]})
+        rows = parse_yaml((self.root / "node_modules" / "mu-dsh-defaults" / "cordis.patch.yml").read_text())
+        self.assertIn({"insert": [{"id": "mu-dsh-files", "name": "mu-dsh-files"}]}, rows)
+
+    def test_mounts_nothing_without_plugins(self):
+        shutil.rmtree(self.plugins / "mu-dsh-files")
+        self.sites().write(parse())
+        self.assertEqual(self.bundle()["dependencies"], {})
+        self.assertEqual((self.root / "node_modules" / "mu-dsh-defaults" / "cordis.patch.yml").read_text(), managed.defaults_text(parse()))
+
+    def test_refuses_a_broken_install(self):
+        shutil.rmtree(self.plugins)
+        with self.assertRaisesRegex(SiteLayerError, "plugins is missing; reinstall"):
+            self.sites().write(parse())
+        self.plugins.mkdir()
+        (self.plugins / "unbuilt").mkdir()
+        with self.assertRaisesRegex(SiteLayerError, "unbuilt/package.json is missing"):
+            self.sites().write(parse())
+        (self.plugins / "unbuilt" / "package.json").write_text('{"name": "unbuilt", "version": "1.0.0"}')
+        with self.assertRaisesRegex(SiteLayerError, "unbuilt/lib holds no built code"):
+            self.sites().write(parse())
+
+    def test_refuses_package_names_that_are_not_plugins(self):
+        for name in ("../escape", "mu-dsh-defaults", "Upper", "@scope/../x"):
+            plugins = self.plugins / "bad"
+            shutil.rmtree(plugins, ignore_errors=True)
+            self.fake_plugin("bad", name)
+            with self.assertRaisesRegex(SiteLayerError, "cannot be a plugin's package name"):
+                self.sites().write(parse())
+        shutil.rmtree(self.plugins / "bad")
+        self.fake_plugin("copy", "mu-dsh-files")
+        with self.assertRaisesRegex(SiteLayerError, "a second plugin named mu-dsh-files"):
+            self.sites().write(parse())
 
     def test_digest_follows_content(self):
         sites = self.sites()
@@ -638,12 +704,13 @@ class SiteLayersTest(unittest.TestCase):
         self.assertEqual(sites.write(parse()).digest, first)
         self.assertNotEqual(sites.write(parse(CONFIG.replace('default_model = "big"', 'default_model = "small"'))).digest, first)
 
-    def test_digest_follows_the_plugin(self):
-        plugin = self.root.parent / "plugin"
-        shutil.copytree(ROOT / "plugin", plugin, ignore=shutil.ignore_patterns("node_modules", "src", "test"))
-        first = self.sites(plugin).write(parse()).digest
-        (plugin / "lib" / "client.js").write_text("changed")
-        self.assertNotEqual(self.sites(plugin).write(parse()).digest, first)
+    def test_digest_follows_the_plugins(self):
+        first = self.sites().write(parse()).digest
+        (self.plugins / "mu-dsh-files" / "lib" / "client.js").write_text("changed")
+        second = self.sites().write(parse()).digest
+        self.assertNotEqual(second, first)
+        self.fake_plugin("extra", "extra")
+        self.assertNotEqual(self.sites().write(parse()).digest, second)
 
 
 class SpecBuilderTest(unittest.TestCase):

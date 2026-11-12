@@ -1,0 +1,3 @@
+[submodule "plugins/mu-dsh-files"]
+	path = plugins/mu-dsh-files
+	url = ../mu-dsh-files.git

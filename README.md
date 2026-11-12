@@ -23,7 +23,7 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 
 **Setup**
 1. Prerequisites: systemd, Python 3.11+, Node.js 23.6+ with npm.
-2. `git clone git@github.com:SleepyMug/mu-dsh.git && cd mu-dsh && sudo ./install.sh`
+2. `git clone --recurse-submodules git@github.com:SleepyMug/mu-dsh.git && cd mu-dsh && sudo ./install.sh`
 3. `sudoedit /etc/mu-dsh/config.toml` — the `[llm]` section; optionally `public_url`
    (left out, users open `http://<any of this host's IPv4 addresses or names>:8080/`).
 4. `sudo systemctl enable --now mu-dsh` (first start downloads dsh from npm).
@@ -52,7 +52,7 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 - npm (dsh install): `sudo systemctl edit mu-dsh`, add `[Service]` / `Environment=HTTPS_PROXY=http://proxy:3128`.
 
 **mu-dsh update**
-- `git pull && sudo ./install.sh && sudo systemctl restart mu-dsh`
+- `git pull && git submodule update --init --recursive && sudo ./install.sh && sudo systemctl restart mu-dsh`
 
 **Uninstall**
 - Keep users and data: `sudo ./install.sh --uninstall`
@@ -79,7 +79,7 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 |---|---|---|---|
 | `control/` → `mu-dsh` | Python 3.11+, stdlib only | root | CLI, Unix accounts, provisioning, dsh install, supervising one dsh per user, PAM password checks |
 | `gateway/` | TypeScript on Node ≥ 23.6, no runtime dependencies | `mu-dsh` | login, per-user reverse proxy (HTTP + WebSocket), LLM relay |
-| `plugin/` → `mu-dsh-files` | TypeScript, a dsh plugin (built output in `plugin/lib/` is committed) | in each user's dsh and browser | a Files tab with folder links and downloads in dsh's web UI |
+| `plugins/` | dsh plugins, one git submodule each (built output committed in each) | in each user's dsh and browser | `mu-dsh-files`: a Files tab with folder links and downloads in dsh's web UI |
 
 They share two things in `/run/mu-dsh`: `gateway.json` (users and process state,
 format in `control/state.py`), written by the Python side and watched by the
@@ -128,7 +128,7 @@ can override and a thin layer of policy they cannot. dsh composes, lowest first:
 | Layer | Written by | Contents |
 |---|---|---|
 | dsh's own bundles (`dsh-base`, `dsh-web-app`, …) | dsh | shipped defaults |
-| `mu-dsh-defaults` bundle (`/opt/mu-dsh/dsh/node_modules/`) | mu-dsh, shared, root-owned | the relay as the model provider, the default model, the `mu-dsh-files` plugin |
+| `mu-dsh-defaults` bundle (`/opt/mu-dsh/dsh/node_modules/`) | mu-dsh, shared, root-owned | the relay as the model provider, the default model, mu-dsh's plugins |
 | `~/.dsh/profiles/<profile>/cordis.patch.yml` | the user, dsh's settings UI | anything, including other models or providers |
 | `~/.dsh/cordis.patch.yml` (home-level) | mu-dsh, rewritten each start | policy: web search off, telemetry off |
 
@@ -161,69 +161,61 @@ file is fixed. From there (or from `/`) the user can:
   stay installed.
 * **Restart workspace**, which also skips the retry backoff.
 
+### Plugins
+
+Each directory under `plugins/` is a dsh plugin in its own repository,
+included as a git submodule; each commits its built output in `lib/`, so
+nothing is built on the server. `install.sh` copies every plugin's
+`package.json` and `lib/` to `/opt/mu-dsh/plugins/<dir>/` (and refuses to
+run while a submodule is not checked out). The daemon installs each next to
+dsh under its package name, lists it as a dependency of the defaults bundle
+(dsh resolves the packages a bundle's rows name through the bundle's own
+dependencies), and mounts it with one row in the bundle's patch. A plugin
+whose submodule is removed is uninstalled the next time mu-dsh starts or
+reloads.
+
+A user can turn a plugin off for themselves with a row in their profile
+patch, e.g. `- id: mu-dsh-files` / `disabled: true`.
+
+To change a plugin, work in its repository (`plugins/<dir>` is a checkout of
+it): build, test, commit `lib/` with the sources, and push. Then commit the
+new submodule commit in mu-dsh (`git add plugins/<dir>`). To add one:
+`git submodule add <url> plugins/<name>`.
+
+The plugins use dsh's internal web client APIs, so a dsh upgrade can break
+them. mu-dsh-files is built so that this costs only its own features: if any
+part of it fails, dsh starts without it and the browser console says why.
+
 ### Files tab and downloads
 
-`plugin/` is a dsh plugin, `mu-dsh-files`, which the defaults bundle mounts
-(the bundle lists it as a dependency, so dsh resolves it next to the bundle).
-It changes nothing in dsh itself; it uses the extension points dsh's web
-client has:
+[mu-dsh-files](https://github.com/SleepyMug/mu-dsh-files) (`plugins/mu-dsh-files`)
+changes nothing in dsh itself; it uses the extension points dsh's web client
+has. Its README describes how it works.
 
-* **Files tab.** dsh's right sidebar lets a plugin take over a built-in tab
-  kind, and mu-dsh-files takes over `files`. dsh's guide card and its
-  Workspace files shortcut open it as before. It is a tree of the
-  session's working directory: expand folders inline, open files, go up
-  a level, reload. While it is visible it follows the disk: every folder
-  shown open is watched, and is listed again shortly after it changes.
-  If the watches stop (the connection dropped, say), a dot on the reload
-  button says changes may be missing until they are back.
-* **Folder links.** In the right sidebar, every file address goes to one
-  tab type, chosen before anything can know whether the path is a file or
-  a folder. The Files tab type claims all of them, ranked above dsh's
-  viewers, and each such tab first asks the host what its path is:
-  * A folder stays, as a Files tab rooted there. A link to the working
-    directory itself becomes the Files page.
-  * Anything else, including a missing path, reopens in the tab's place
-    with the viewer dsh would otherwise have used, keeping the line a link
-    points at.
-
-  Repeated links reuse open tabs as before. The cost is one small request
-  before every file opens.
+* **Files tab.** It takes over dsh's Files tab, so dsh's guide card and
+  Workspace files shortcut open it as before. It is a tree of the session's
+  working directory: expand folders inline, open files, go up a level,
+  reload. While it is visible it follows the disk: every folder shown open
+  is watched, and is listed again shortly after it changes. If the watches
+  stop (the connection dropped, say), a dot on the reload button says
+  changes may be missing until they are back.
+* **Folder links.** A link to a folder opens a Files tab rooted there; a
+  link to the working directory opens the Files page. Links to files open
+  dsh's preview as before, keeping the line a link points at; this costs
+  one small request before every file opens.
 * **Downloads.** There is a download button:
   * in dsh's file preview header and its "cannot preview" state;
   * on every row and on the header of a Files tab.
 
   Folders download as a ZIP archive named after them. The button asks
   first, so a refusal is shown next to it, naming the path: dsh may not
-  read the file, or the folder is over 65,535 entries or 2 GiB. Then the
-  browser streams the download to disk.
+  read the file, or the folder is over 65,535 entries or 2 GiB.
 
-The host half adds three routes to dsh's `/api`: `mu-dsh-files.entry`,
-`mu-dsh-files.download`, and `mu-dsh-files.watch`. dsh authenticates them
-like its own, and they go through dsh's filesystem service, so they reach
-exactly what the user's dsh may read, as the user.
-
-Watching works like this:
-* A browser page holds one long-lived stream (newline-delimited JSON, with
-  a ping every 20 s).
-* It names the folders to watch with small requests beside the stream.
-* The host keeps each watch up:
-  * it retries a failed watch with backoff;
-  * it watches again when a path becomes, or stops being, a folder;
-  * it reports at most one change per folder per second.
-* A page that loses its stream opens another and asks again.
-
-The plugin uses dsh's internal web client APIs, so a dsh upgrade can break it.
-It is built so that this costs only its own features: its parts wait for the
-dsh services they use and register as one unit, and if any part fails, dsh
-starts without them (its preview, links and its own Files tab work as without
-the plugin) and the browser console says why. A user can turn it off for
-themselves with a row in their profile patch: `- id: mu-dsh-files` /
-`disabled: true`.
-
-To change it: edit `plugin/src`, then `cd plugin && pnpm install && pnpm run
-typecheck && pnpm test && pnpm run build`, and commit `plugin/lib` with the
-sources. `install.sh` copies `plugin/package.json` and `plugin/lib`; nothing
-is built on the server.
+Its host half adds three routes to dsh's `/api` (`mu-dsh-files.entry`,
+`.download`, and `.watch`). dsh authenticates them like its own, and they
+go through dsh's filesystem service, so they reach exactly what the user's
+dsh may read, as the user. If it fails to load, dsh's own preview, links and
+Files tab work as without it.
 
 ### How sign-in works
 
@@ -248,7 +240,7 @@ Prerequisites: systemd, `python3` ≥ 3.11, Node.js ≥ 23.6 with `npm` on `PATH
 and network access to the npm registry (or a mirror) on first start.
 
 ```sh
-git clone <repo> mu-dsh && cd mu-dsh
+git clone --recurse-submodules <repo> mu-dsh && cd mu-dsh
 sudo ./install.sh                       # code → /opt/mu-dsh, units, /usr/local/bin/mu-dsh
 sudoedit /etc/mu-dsh/config.toml        # public URL, inference service, models
 sudo systemctl enable --now mu-dsh      # first start installs dsh from npm
@@ -257,17 +249,17 @@ sudo mu-dsh user add alice              # creates the Unix account; prompts for 
 
 Users then open `public_url` (e.g. `http://gw.example.internal:8080/`) and sign in.
 
-Upgrade mu-dsh: `git pull && sudo ./install.sh && sudo systemctl restart mu-dsh`.
+Upgrade mu-dsh: `git pull && git submodule update --init --recursive && sudo ./install.sh && sudo systemctl restart mu-dsh`.
 Upgrade dsh: change `dsh.version` in the config, then `sudo systemctl restart mu-dsh`.
 Remove: `sudo ./install.sh --uninstall` keeps users and state; `--uninstall --purge`
 also deletes every managed user's account and home directory.
 
 | Path | Contents |
 |---|---|
-| `/opt/mu-dsh/{control,gateway,plugin}` | code |
+| `/opt/mu-dsh/{control,gateway,plugins}` | code; `plugins/<dir>` holds each plugin's `package.json` and `lib/` |
 | `/opt/mu-dsh/dsh/versions/<v>`, `current` | pinned dsh installs (current + previous kept) |
 | `/opt/mu-dsh/dsh/node_modules/mu-dsh-defaults` | generated defaults bundle (provider, default model) |
-| `/opt/mu-dsh/dsh/node_modules/mu-dsh-files` | the plugin, copied from `/opt/mu-dsh/plugin` |
+| `/opt/mu-dsh/dsh/node_modules/<plugin>` | each plugin, by package name, copied from `/opt/mu-dsh/plugins` |
 | `/etc/mu-dsh/config.toml` | configuration (0600; holds the upstream key) |
 | `/var/lib/mu-dsh/users.json`, `session-secret` | managed users, ports, relay keys |
 | `/run/mu-dsh/gateway.json`, `control.sock` | control plane ↔ gateway (root:mu-dsh) |
@@ -304,8 +296,7 @@ prefixed with its user; relay requests are logged per user).
 ```sh
 python3 -m unittest discover -s tests/unit      # control plane (host)
 cd gateway && node --test test/                 # gateway (host)
-cd plugin && node --test test/                  # dsh plugin routes, watches and tree logic (host)
-cd plugin && node build.mjs --check             # plugin/lib matches plugin/src (after pnpm install)
+cd plugins/mu-dsh-files && pnpm install && pnpm test   # a plugin's own tests (see its README)
 python3 tests/vm/vm.py test                     # full system tests in a QEMU VM
 ```
 
@@ -332,9 +323,9 @@ python3 tests/vm/vm.py down
 python3 tests/vm/vm.py build-base --force       # rebuild the base image
 ```
 
-For type-checking the gateway: `cd gateway && npm install && npm run typecheck`;
-the plugin: `cd plugin && pnpm install && pnpm run typecheck` (its dev dependencies
-pin dsh's packages at the version in `packaging/config.example.toml`).
+For type-checking the gateway: `cd gateway && npm install && npm run typecheck`.
+A plugin type-checks in its own repository; mu-dsh-files's dev dependencies pin
+dsh's packages at the version in `packaging/config.example.toml`.
 
 ## Known limitations
 

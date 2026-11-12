@@ -281,12 +281,14 @@ class VM:
         )
 
     def put_repo(self, remote: str = "/root/mu-dsh") -> None:
-        """Copy the working tree (tracked and untracked, minus ignored files)."""
-        files = subprocess.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            cwd=REPO, capture_output=True, check=True,
-        ).stdout
-        names = [n for n in files.decode().split("\0") if n and (REPO / n).exists()]
+        """Copy the working tree: tracked and untracked files minus ignored ones, and the
+        submodules' tracked files (files not yet added in a submodule stay behind)."""
+        listings = [
+            ["git", "ls-files", "-z", "--cached", "--recurse-submodules"],
+            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
+        ]
+        files = b"".join(subprocess.run(argv, cwd=REPO, capture_output=True, check=True).stdout for argv in listings)
+        names = sorted({n for n in files.decode().split("\0") if n and (REPO / n).is_file()})
         tar = subprocess.run(["tar", "-c", "-f", "-", "-C", str(REPO), "--", *names], capture_output=True, check=True).stdout
         self.ssh(f"rm -rf {shlex.quote(remote)} && mkdir -p {shlex.quote(remote)} && tar -x -f - -C {shlex.quote(remote)}", input=tar)
 

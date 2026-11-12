@@ -70,6 +70,12 @@ for tool in useradd userdel chpasswd pkill pgrep; do
     command -v "$tool" >/dev/null || die "$tool not found"
 done
 ldconfig -p 2>/dev/null | grep -q 'libpam\.so\.0' || die "libpam (libpam0g) not found"
+# The dsh plugins are git submodules, each committing its built lib/.
+for dir in "$SRC"/plugins/*/; do
+    [ -d "$dir" ] || continue
+    [ -f "${dir}package.json" ] && [ -d "${dir}lib" ] \
+        || die "${dir#"$SRC"/} is not checked out; run: git submodule update --init --recursive"
+done
 
 # --- service account ---------------------------------------------------------
 if ! id "$SVC_USER" >/dev/null 2>&1; then
@@ -80,18 +86,25 @@ fi
 # --- code ----------------------------------------------------------------------
 say "installing code into $PREFIX"
 install -d -m 0755 "$PREFIX" "$PREFIX/gateway"
-rm -rf "$PREFIX/control" "$PREFIX/gateway/src" "$PREFIX/plugin"
+# ($PREFIX/plugin is where mu-dsh-files was installed before plugins/ held submodules.)
+rm -rf "$PREFIX/control" "$PREFIX/gateway/src" "$PREFIX/plugins" "$PREFIX/plugin"
 cp -R "$SRC/control" "$PREFIX/control"
 cp -R "$SRC/gateway/src" "$PREFIX/gateway/src"
 cp "$SRC/gateway/package.json" "$PREFIX/gateway/package.json"
-# The dsh plugin, built (plugin/lib is committed); the daemon copies it next to dsh.
-install -d -m 0755 "$PREFIX/plugin" "$PREFIX/plugin/lib"
-cp "$SRC/plugin/package.json" "$PREFIX/plugin/package.json"
-cp "$SRC/plugin/lib/index.js" "$SRC/plugin/lib/client.js" "$PREFIX/plugin/lib/"
+# The dsh plugins, as built: package.json and lib/ of each. The daemon copies
+# them next to dsh, and the defaults bundle mounts every one.
+install -d -m 0755 "$PREFIX/plugins"
+for dir in "$SRC"/plugins/*/; do
+    [ -d "$dir" ] || continue
+    target="$PREFIX/plugins/$(basename "$dir")"
+    install -d -m 0755 "$target"
+    cp "${dir}package.json" "$target/package.json"
+    cp -R "${dir}lib" "$target/lib"
+done
 cp "$SRC/README.md" "$PREFIX/README.md" 2>/dev/null || true
 find "$PREFIX/control" -name __pycache__ -prune -exec rm -rf {} +
-chown -R root:root "$PREFIX/control" "$PREFIX/gateway" "$PREFIX/plugin"
-chmod -R u=rwX,go=rX "$PREFIX/control" "$PREFIX/gateway" "$PREFIX/plugin"
+chown -R root:root "$PREFIX/control" "$PREFIX/gateway" "$PREFIX/plugins"
+chmod -R u=rwX,go=rX "$PREFIX/control" "$PREFIX/gateway" "$PREFIX/plugins"
 
 cat > "$BIN/mu-dsh" <<EOF
 #!/bin/sh

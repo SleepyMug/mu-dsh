@@ -321,6 +321,14 @@ class SystemTest(unittest.TestCase):
         self.assertNotIn("Next steps", out.stdout)
         self.assertIn("systemctl restart mu-dsh", out.stdout)
         self.assertEqual(self.sh("sha256sum /etc/mu-dsh/config.toml").stdout, before)
+        # A source tree whose plugin submodule is not checked out is refused before anything changes.
+        installed = self.sh("sha256sum /opt/mu-dsh/plugins/mu-dsh-files/lib/client.js").stdout
+        self.sh("rm -rf /root/unchecked && cp -R /root/mu-dsh /root/unchecked && rm -rf /root/unchecked/plugins/mu-dsh-files/*")
+        refused = self.sh("cd /root/unchecked && ./install.sh", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("plugins/mu-dsh-files/ is not checked out; run: git submodule update --init", refused.stderr)
+        self.assertEqual(self.sh("sha256sum /opt/mu-dsh/plugins/mu-dsh-files/lib/client.js").stdout, installed)
+        self.sh("rm -rf /root/unchecked")
 
     def test_04_user_add(self):
         for user, password in PASSWORDS.items():
@@ -456,7 +464,9 @@ class SystemTest(unittest.TestCase):
         self.assertTrue(log.stdout, "relay did not log alice's request")
 
     def test_11a_files_plugin(self):
-        # Installed next to dsh as a dependency of the defaults bundle, which mounts it.
+        # Copied from the plugins/ submodule, then installed next to dsh as a dependency of the
+        # defaults bundle, which mounts it.
+        self.assertEqual(self.sh("ls /opt/mu-dsh/plugins/mu-dsh-files").stdout.split(), ["lib", "package.json"])
         plugin = "/opt/mu-dsh/dsh/node_modules/mu-dsh-files"
         self.assertEqual(self.sh(f"stat -c '%U %a' {plugin}/lib/client.js").stdout.split(), ["root", "644"])
         bundle = json.loads(self.sh("cat /opt/mu-dsh/dsh/node_modules/mu-dsh-defaults/package.json").stdout)
