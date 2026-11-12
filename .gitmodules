@@ -1,3 +1,3 @@
 [submodule "plugins/mu-dsh-files"]
 	path = plugins/mu-dsh-files
-	url = ../mu-dsh-files.git
+	url = https://github.com/SleepyMug/mu-dsh-files.git

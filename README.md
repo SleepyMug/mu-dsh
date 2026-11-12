@@ -180,7 +180,11 @@ patch, e.g. `- id: mu-dsh-files` / `disabled: true`.
 To change a plugin, work in its repository (`plugins/<dir>` is a checkout of
 it): build, test, commit `lib/` with the sources, and push. Then commit the
 new submodule commit in mu-dsh (`git add plugins/<dir>`). To add one:
-`git submodule add <url> plugins/<name>`.
+`git submodule add https://github.com/<owner>/<repo>.git plugins/<name>`.
+Submodule URLs are absolute HTTPS URLs, so a server fetches plugins without
+keys and nothing depends on where other repositories are cloned. To push from
+a submodule checkout over SSH:
+`git config --global url."git@github.com:".pushInsteadOf "https://github.com/"`.
 
 The plugins use dsh's internal web client APIs, so a dsh upgrade can break
 them. mu-dsh-files is built so that this costs only its own features: if any
