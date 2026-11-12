@@ -903,6 +903,11 @@ function fsErrorCode(error) {
   if (typeof code !== "string") return void 0;
   return code.startsWith("FS_") ? code : ERRNO[code];
 }
+function refusalOf(error) {
+  const code = fsErrorCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return { error: code === void 0 ? "unavailable" : refusalFor(code).error, message };
+}
 function refusalFor(code) {
   switch (code) {
     case "FS_NOT_FOUND":
@@ -925,6 +930,7 @@ function refusalFor(code) {
 // src/wire.ts
 var ENTRY_PATH = "/api/mu-dsh-files.entry";
 var DOWNLOAD_PATH = "/api/mu-dsh-files.download";
+var WATCH_PATH = "/api/mu-dsh-files.watch";
 var REFUSAL_HEADER = "X-Mu-Dsh-Refusal";
 
 // src/http.ts
@@ -1160,6 +1166,300 @@ async function entry(files, request, listLimit = LIST_LIMIT) {
   }
 }
 
+// src/watch.ts
+import { randomUUID } from "node:crypto";
+import { isAbsolute as isAbsolute2 } from "node:path";
+var WATCH_OPTIONS = {
+  heartbeatMs: 2e4,
+  settleMs: 100,
+  intervalMs: 1e3,
+  retryMs: 1e3,
+  retryMaxMs: 6e4,
+  maxPaths: 512,
+  maxStreams: 16,
+  maxQueuedBytes: 1024 ** 2
+};
+var Watches = class {
+  files;
+  options;
+  /** In the order they were opened. */
+  streams = /* @__PURE__ */ new Map();
+  constructor(files, options = WATCH_OPTIONS) {
+    this.files = files;
+    this.options = options;
+  }
+  fetch(request) {
+    return request.method === "POST" ? this.control(request) : this.open(request);
+  }
+  /** `GET`: a new stream, which lasts as long as the request. */
+  open(request) {
+    for (const stream2 of this.streams.values()) {
+      if (this.streams.size < this.options.maxStreams) break;
+      void stream2.end();
+    }
+    const id = randomUUID();
+    const stream = new WatchStream(id, this.files, this.options, () => {
+      this.streams.delete(id);
+    });
+    this.streams.set(id, stream);
+    stream.endWith(request.signal);
+    return new Response(stream.body, {
+      headers: headers({
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        // Proxies such as nginx would otherwise hold events back to fill a buffer.
+        "X-Accel-Buffering": "no"
+      })
+    });
+  }
+  /** `POST`: change what a stream watches. Removals apply before additions. */
+  async control(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return refuse(400, "bad-request", "the body is not JSON");
+    }
+    const control = parseControl(body, this.options.maxPaths);
+    if (typeof control === "string") return refuse(400, "bad-request", control);
+    const stream = this.streams.get(control.stream);
+    if (stream === void 0) return refuse(404, "not-found", "this watch stream has ended");
+    for (const path of control.remove ?? []) stream.unwatch(path);
+    for (const path of control.add ?? []) stream.watch(path);
+    return json({});
+  }
+  /** End every stream and close its watches: the host half is going away. */
+  async close() {
+    await Promise.all([...this.streams.values()].map((stream) => stream.end()));
+  }
+};
+function parseControl(body, maxPaths) {
+  if (typeof body !== "object" || body === null) return "the body must be an object";
+  const { stream, add, remove } = body;
+  if (typeof stream !== "string" || stream === "") return "stream must name a stream";
+  for (const [name2, paths] of [["add", add], ["remove", remove]]) {
+    if (paths === void 0) continue;
+    if (!Array.isArray(paths) || paths.length > maxPaths) return `${name2} must be a list of at most ${maxPaths} paths`;
+    for (const path of paths) {
+      if (typeof path !== "string" || path.includes("\0") || !isAbsolute2(path)) return `${name2} must hold absolute paths`;
+    }
+  }
+  return { stream, add, remove };
+}
+var encoder = new TextEncoder();
+var WatchStream = class {
+  id;
+  body;
+  files;
+  options;
+  onEnd;
+  controller;
+  paths = /* @__PURE__ */ new Map();
+  heartbeat;
+  ended = false;
+  closing;
+  constructor(id, files, options, onEnd) {
+    this.id = id;
+    this.files = files;
+    this.options = options;
+    this.onEnd = onEnd;
+    this.body = new ReadableStream(
+      {
+        start: (controller) => {
+          this.controller = controller;
+        },
+        cancel: () => this.end()
+      },
+      new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 })
+    );
+    this.send({ type: "open", stream: id, heartbeatMs: options.heartbeatMs });
+    this.heartbeat = setInterval(() => {
+      this.send({ type: "ping" });
+    }, options.heartbeatMs);
+    this.heartbeat.unref();
+  }
+  /** End with the request: dsh's bridge stops writing when the browser leaves, but reads until the body ends. */
+  endWith(signal) {
+    if (signal.aborted) void this.end();
+    else signal.addEventListener("abort", () => {
+      void this.end();
+    }, { once: true });
+  }
+  send(event) {
+    if (this.ended) return;
+    this.controller.enqueue(encoder.encode(`${JSON.stringify(event)}
+`));
+    if ((this.controller.desiredSize ?? 0) < -this.options.maxQueuedBytes) void this.end();
+  }
+  watch(path) {
+    if (this.ended) return;
+    const existing = this.paths.get(path);
+    if (existing !== void 0) {
+      existing.confirm();
+      return;
+    }
+    if (this.paths.size >= this.options.maxPaths) {
+      const message = `one page may watch at most ${this.options.maxPaths} paths at once`;
+      this.send({ type: "lost", path, refusal: { error: "too-large", message }, retrying: false });
+      return;
+    }
+    const watch = new PathWatch(path, this.files, this.options, (event) => {
+      this.send(event);
+    });
+    this.paths.set(path, watch);
+    watch.start();
+  }
+  unwatch(path) {
+    const watch = this.paths.get(path);
+    if (watch === void 0) return;
+    this.paths.delete(path);
+    void watch.stop();
+  }
+  /** End the stream (its reader sees the end after what is queued) and close every watch. */
+  end() {
+    if (this.closing === void 0) {
+      this.ended = true;
+      clearInterval(this.heartbeat);
+      this.onEnd();
+      try {
+        this.controller.close();
+      } catch {
+      }
+      const watches = [...this.paths.values()];
+      this.paths.clear();
+      this.closing = Promise.all(watches.map((watch) => watch.stop())).then(() => {
+      });
+    }
+    return this.closing;
+  }
+};
+var PathWatch = class {
+  path;
+  files;
+  options;
+  emit;
+  /** The current attempt: it ends when the watch is replaced or stopped, and nothing it started may report after. */
+  attempt;
+  close;
+  /** What the current watch was started on. */
+  watched;
+  reported;
+  failures = 0;
+  retry;
+  settle;
+  lastChange = -Infinity;
+  stopped = false;
+  constructor(path, files, options, emit) {
+    this.path = path;
+    this.files = files;
+    this.options = options;
+    this.emit = emit;
+  }
+  start() {
+    void this.begin();
+  }
+  /** Asked to watch again: say where it stands. A watch still starting says so when it is done. */
+  confirm() {
+    if (this.reported !== void 0) this.emit(this.reported);
+  }
+  async stop() {
+    this.stopped = true;
+    clearTimeout(this.retry);
+    await this.detach();
+  }
+  async begin() {
+    if (this.stopped) return;
+    const attempt = new AbortController();
+    this.attempt = attempt;
+    const { signal } = attempt;
+    try {
+      const target = await this.files.resolve(this.path, { signal });
+      const form = formOf(await this.files.stat(target, signal));
+      const close = await this.files.watch(target, (error) => {
+        this.changed(attempt, error);
+      }, signal);
+      if (signal.aborted) {
+        await close();
+        return;
+      }
+      this.close = close;
+      this.watched = { key: String(target.targetKey), form };
+      this.failures = 0;
+      this.report({ type: "ready", path: this.path });
+    } catch (error) {
+      if (!signal.aborted) this.fail(attempt, error);
+    }
+  }
+  changed(attempt, error) {
+    if (attempt !== this.attempt) return;
+    if (error !== void 0) {
+      this.fail(attempt, error);
+      return;
+    }
+    if (this.settle !== void 0) return;
+    const wait = Math.max(this.options.settleMs, this.lastChange + this.options.intervalMs - Date.now());
+    this.settle = later(wait, () => {
+      this.settle = void 0;
+      void this.flush(attempt);
+    });
+  }
+  async flush(attempt) {
+    if (attempt !== this.attempt) return;
+    this.lastChange = Date.now();
+    this.emit({ type: "change", path: this.path });
+    let now;
+    try {
+      const target = await this.files.resolve(this.path, { signal: attempt.signal });
+      now = { key: String(target.targetKey), form: formOf(await this.files.stat(target, attempt.signal)) };
+    } catch {
+      return;
+    }
+    if (attempt !== this.attempt) return;
+    if (now.key !== this.watched?.key || now.form !== this.watched.form) {
+      void this.detach();
+      void this.begin();
+    }
+  }
+  fail(attempt, error) {
+    if (attempt !== this.attempt) return;
+    void this.detach();
+    this.report({ type: "lost", path: this.path, refusal: refusalOf(error), retrying: true });
+    const delay = Math.min(this.options.retryMaxMs, this.options.retryMs * 2 ** this.failures);
+    this.failures += 1;
+    this.retry = later(delay, () => {
+      this.retry = void 0;
+      void this.begin();
+    });
+  }
+  /** Report a change of standing; failing again while already lost says nothing new. */
+  report(event) {
+    const repeated = event.type === "lost" && this.reported?.type === "lost";
+    this.reported = event;
+    if (!repeated) this.emit(event);
+  }
+  /** End the current attempt, closing its watch once it has one. */
+  async detach() {
+    this.attempt?.abort();
+    this.attempt = void 0;
+    this.watched = void 0;
+    clearTimeout(this.settle);
+    this.settle = void 0;
+    const close = this.close;
+    this.close = void 0;
+    try {
+      await close?.();
+    } catch {
+    }
+  }
+};
+function formOf(info) {
+  return info?.type === "directory" ? "directory" : "other";
+}
+function later(ms, run) {
+  const timer = setTimeout(run, ms);
+  timer.unref();
+  return timer;
+}
+
 // src/index.ts
 var name = "mu-dsh-files";
 function apply(ctx) {
@@ -1176,6 +1476,19 @@ function apply(ctx) {
       requestBody: "buffered",
       fetch: (request) => download(ctx2.fs, request)
     }), "mu-dsh-files: download route");
+    ctx2.effect(() => {
+      const watches = new Watches(ctx2.fs);
+      const route = ctx2.connection.fetch.register({
+        path: WATCH_PATH,
+        methods: ["GET", "POST"],
+        requestBody: "buffered",
+        fetch: async (request) => watches.fetch(request)
+      });
+      return () => {
+        route();
+        void watches.close();
+      };
+    }, "mu-dsh-files: watch route");
   });
 }
 export {

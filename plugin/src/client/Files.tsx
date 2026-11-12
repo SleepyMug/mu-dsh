@@ -1,10 +1,10 @@
 /**
- * The folder tab's body and chip title. The body draws what the tab's
- * FolderModel says and turns clicks into the face's actions; it decides
- * nothing about routing itself.
+ * The Files tab's body and chip title. The body draws what the tab's
+ * TreeModel says and turns clicks into the face's actions; it decides nothing
+ * about routing itself.
  */
 
-import { useEffect, useRef, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useRef, useSyncExternalStore, type ReactNode } from 'react'
 import {
   FileTypeIcon,
   IconChevronUpOutlineRegular,
@@ -19,36 +19,37 @@ import {
 import type { UseSidebarRightTabInfo, SidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type { UseSessions } from '@deepseek-ai/dsh-client-ui-session/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { parseFileAddress } from '@deepseek-ai/dsh-util-workspace-path'
 import type { DirectoryEntry } from '../wire.ts'
 import type { FilesApi } from './api.ts'
 import { Download, refusalText, type Translate } from './Download.tsx'
-import type { FolderHost, FolderModel, FolderModels, FolderSnapshot } from './folder.ts'
-import { childOf, parentOf, sessionPathOf } from './paths.ts'
+import { childOf, originOf, parentOf, sessionOf } from './paths.ts'
 import { css } from './styles.ts'
+import type { TreeModel, TreeModels, TreeNavigator, TreeSnapshot } from './tree.ts'
 
 export type Tab = SidebarRightTabInfo['tab']
 
-/** What the folder tab needs from the plugin around it (index.ts). */
-export interface FolderFace {
-  readonly models: FolderModels
+/** What the Files tab needs from the plugin around it (index.ts). */
+export interface FilesFace {
+  readonly models: TreeModels
   readonly api: FilesApi
-  /** The tab's FolderHost: its entry reads, and its hand-off to the next viewer. */
-  host(sessionId: SessionId, tab: () => Tab): FolderHost
+  /** What the tab may do in the sidebar; it reads the tab when it acts, so it must see the latest navigation. */
+  navigator(sessionId: SessionId, tab: () => Tab): TreeNavigator
   /** Open a file the tree lists, in the tab's pane, with the viewer the sidebar ranks first for it. */
   openFile(sessionId: SessionId, cwd: string | undefined, path: string, paneId: string): void
-  /** Show another folder in this tab's place. */
+  /** Show another folder in the tab's place: the Files page for the working directory, a folder tab for anything else. */
   openFolder(tab: Tab, sessionId: SessionId, cwd: string | undefined, path: string): void
 }
 
-export interface FolderBodyProps {
+export interface FilesBodyProps {
   readonly useTabInfo: UseSidebarRightTabInfo
   readonly useSessions: UseSessions
   readonly sessionId: SessionId
   readonly t: Translate
-  readonly face: FolderFace
+  readonly face: FilesFace
 }
 
-function useModel(model: FolderModel): FolderSnapshot {
+function useModel(model: TreeModel): TreeSnapshot {
   return useSyncExternalStore(model.subscribe, model.getSnapshot)
 }
 
@@ -62,28 +63,43 @@ export function ordered(entries: readonly DirectoryEntry[]): DirectoryEntry[] {
   })
 }
 
-export function FolderBody({ useTabInfo, useSessions, sessionId, t, face }: FolderBodyProps) {
+export function FilesBody({ useTabInfo, useSessions, sessionId, t, face }: FilesBodyProps) {
   const { tab, panel } = useTabInfo()
-  const cwd = useSessions(sessions => sessions.byId[sessionId]?.cwd)
+  const session = sessionOf(tab.contentId, sessionId)
+  const cwd = useSessions(sessions => sessions.byId[session]?.cwd)
   const model = face.models.get(tab.id, tab.signal)
   const snapshot = useModel(model)
-  // The host reads the tab when it hands off, so it must see the latest navigation.
   const latest = useRef(tab)
   latest.current = tab
-  const host = useRef<FolderHost | null>(null)
-  host.current ??= face.host(sessionId, () => latest.current)
-  const absolute = sessionPathOf(tab.contentId, () => cwd)?.absolute
+  const navigator = useRef<TreeNavigator | null>(null)
+  navigator.current ??= face.navigator(session, () => latest.current)
+  const origin = originOf(tab.contentId, cwd)
+  const path = origin.kind === 'workspace' ? origin.root : origin.path
+  const workspace = origin.kind === 'workspace' ? origin.root : origin.workspace
   const { revision } = tab.navigation
+  const { phase } = snapshot
+  const root = phase.kind === 'directory' ? phase.root : undefined
+  const scroller = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    void model.open(absolute, host.current!)
-  }, [model, absolute, revision])
+    void model.open(origin, navigator.current!)
+    // The origin is rebuilt on every render; these values are what it holds.
+  }, [model, origin.kind, path, workspace, revision])
 
-  useEffect(() => tab.actions.bindCommands({ refresh: () => { void model.refresh(host.current!) } }), [tab.actions, model])
+  useEffect(() => {
+    model.setVisible(tab.visible)
+    return () => { model.setVisible(false) }
+  }, [model, tab.visible])
 
-  const { phase } = snapshot
+  useEffect(() => tab.actions.bindCommands({ refresh: () => { model.refresh() } }), [tab.actions, model])
+
+  useLayoutEffect(() => {
+    if (scroller.current !== null) scroller.current.scrollTop = model.scrollTop
+  }, [model, root])
+
   if (phase.kind === 'handed-off') return null
   if (phase.kind === 'probing') return <Status line={t('opening')} />
+  if (phase.kind === 'no-workspace') return <Status line={t('noWorkspace')} />
   if (phase.kind === 'failed') return <Status line={refusalText(t, phase.refusal)} />
   if (phase.kind === 'unviewable') {
     return (
@@ -93,45 +109,46 @@ export function FolderBody({ useTabInfo, useSessions, sessionId, t, face }: Fold
     )
   }
 
-  const { root } = phase
-  const parent = parentOf(root)
+  const parent = parentOf(phase.root)
   const tree: Tree = {
     snapshot,
     t,
     api: face.api,
-    onToggle: (path) => { void model.toggle(path, host.current!) },
-    onOpen: (path) => { face.openFile(sessionId, cwd, path, panel.id) },
+    onToggle: (path) => { model.toggle(path) },
+    onOpen: (path) => { face.openFile(session, cwd, path, panel.id) },
   }
+  const reload = t(snapshot.stale ? 'reload.stale' : 'reload')
   return (
-    <div className={css.root} data-mu-dsh-folder={root}>
+    <div className={css.root} data-mu-dsh-files={phase.root} data-mu-dsh-origin={origin.kind}>
       <div className={css.header}>
-        <PathLabel path={root} className={css.path} />
+        <PathLabel path={phase.root} className={css.path} />
         {parent !== undefined && (
           <Tooltip label={t('up')} side="bottom" delayMs={500}>
             <button type="button" className={css.tool} aria-label={t('up')} data-mu-dsh-up
-              onClick={() => { face.openFolder(tab, sessionId, cwd, parent) }}>
+              onClick={() => { face.openFolder(tab, session, cwd, parent) }}>
               <IconChevronUpOutlineRegular />
             </button>
           </Tooltip>
         )}
-        <Tooltip label={t('reload')} shortcutKeys={tab.refreshShortcut?.keys} side="bottom" delayMs={500}>
-          <button type="button" className={css.tool} aria-label={t('reload')} aria-keyshortcuts={tab.refreshShortcut?.aria} data-mu-dsh-reload
-            onClick={() => { void model.refresh(host.current!) }}>
+        <Tooltip label={reload} shortcutKeys={tab.refreshShortcut?.keys} side="bottom" delayMs={500}>
+          <button type="button" className={css.tool} aria-label={reload} aria-keyshortcuts={tab.refreshShortcut?.aria}
+            data-mu-dsh-reload data-state={snapshot.stale ? 'stale' : undefined}
+            onClick={() => { model.refresh() }}>
             <IconRefreshOutlineRegular />
           </button>
         </Tooltip>
-        <Download api={face.api} path={root} archive t={t} variant="tool" />
+        <Download api={face.api} path={phase.root} archive t={t} variant="tool" />
       </div>
-      <div className={css.body}>
+      <div ref={scroller} className={css.body} onScroll={(event) => { model.scrollTop = event.currentTarget.scrollTop }}>
         <ul className={css.level}>
-          <Level path={root} tree={tree} />
+          <Level path={phase.root} tree={tree} />
         </ul>
       </div>
     </div>
   )
 }
 
-function Status({ line, children }: { line: string; children?: React.ReactNode }) {
+function Status({ line, children }: { line: string; children?: ReactNode }) {
   return (
     <div className={css.status} data-mu-dsh-status>
       <p className={css.statusLine}>{line}</p>
@@ -141,7 +158,7 @@ function Status({ line, children }: { line: string; children?: React.ReactNode }
 }
 
 interface Tree {
-  readonly snapshot: FolderSnapshot
+  readonly snapshot: TreeSnapshot
   readonly t: Translate
   readonly api: FilesApi
   onToggle(path: string): void
@@ -155,6 +172,7 @@ function Level({ path, tree }: { path: string; tree: Tree }) {
   if (level.kind === 'failed') return <li className={css.note} data-mu-dsh-failed={level.refusal.error}>{refusalText(t, level.refusal)}</li>
   return (
     <>
+      {level.failure !== undefined && <li className={css.note} data-mu-dsh-failed={level.failure.error}>{refusalText(t, level.failure)}</li>}
       {level.entries.length === 0 && <li className={css.note}>{t('empty')}</li>}
       {ordered(level.entries).map(entry => <Entry key={entry.name} parent={path} entry={entry} tree={tree} />)}
       {level.truncated && <li className={css.note}>{t('truncated')}</li>}
@@ -205,16 +223,21 @@ function Entry({ parent, entry, tree }: { parent: string; entry: DirectoryEntry;
   )
 }
 
-export interface FolderTitleProps {
+export interface FilesTitleProps {
   readonly useTabInfo: UseSidebarRightTabInfo
-  readonly face: FolderFace
+  readonly face: FilesFace
 }
 
-/** A folder glyph once the path is known to be one; until then, the glyph its name suggests, as dsh's preview chip shows. */
-export function FolderTitle({ useTabInfo, face }: FolderTitleProps) {
+/**
+ * A folder glyph for the Files page, and for a folder tab once its path is
+ * known to be one; until then, the glyph its name suggests, as dsh's preview
+ * chip shows.
+ */
+export function FilesTitle({ useTabInfo, face }: FilesTitleProps) {
   const { tab } = useTabInfo()
   const snapshot = useModel(face.models.get(tab.id, tab.signal))
-  const icon = snapshot.phase.kind === 'directory'
+  const folder = parseFileAddress(tab.contentId) === undefined || snapshot.phase.kind === 'directory'
+  const icon = folder
     ? <FileTypeIcon kind="folder" size={16} className={css.titleIcon} />
     : <FileTypeIcon path={tab.title} size={16} className={css.titleIcon} />
   return <>{icon}{tab.title}</>

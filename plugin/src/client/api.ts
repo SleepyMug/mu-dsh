@@ -4,13 +4,23 @@
  * (mu-dsh serves each user's dsh at /u/<user>/).
  */
 
-import { DOWNLOAD_PATH, ENTRY_PATH, REFUSAL_HEADER, type Entry, type Refusal, type RefusalCode } from '../wire.ts'
+import {
+  DOWNLOAD_PATH,
+  ENTRY_PATH,
+  REFUSAL_HEADER,
+  WATCH_PATH,
+  type Entry,
+  type Refusal,
+  type RefusalCode,
+  type WatchControl,
+  type WatchEvent,
+} from '../wire.ts'
 
 export type Result<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly refusal: Refusal }
 
-export function routeUrl(base: string, route: string, path: string): string {
+export function routeUrl(base: string, route: string, path?: string): string {
   const url = new URL(route.slice(1), base)
-  url.searchParams.set('path', path)
+  if (path !== undefined) url.searchParams.set('path', path)
   return url.href
 }
 
@@ -88,6 +98,65 @@ export class FilesApi {
     } catch (error) {
       if (signal.aborted) throw error
       return failed(error)
+    }
+  }
+
+  /**
+   * Open a watch stream and read its events until it ends or `signal` aborts.
+   * Rejects when the stream cannot be opened or breaks.
+   */
+  async *watchEvents(signal: AbortSignal): AsyncGenerator<WatchEvent> {
+    const response = await this.fetch(routeUrl(this.base(), WATCH_PATH), { signal, cache: 'no-store' })
+    if (!response.ok || response.body === null) {
+      await response.body?.cancel()
+      throw new Error(`the host refused a watch stream: HTTP ${response.status}`)
+    }
+    for await (const line of linesOf(chunksOf(response.body.pipeThrough(new TextDecoderStream())))) {
+      if (line !== '') yield JSON.parse(line) as WatchEvent
+    }
+  }
+
+  /**
+   * Change what a watch stream watches. `false` when the host no longer has
+   * the stream; rejects when the host cannot be reached or refuses.
+   */
+  async watchControl(control: WatchControl): Promise<boolean> {
+    const response = await this.fetch(routeUrl(this.base(), WATCH_PATH), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(control),
+    })
+    await response.body?.cancel()
+    if (response.ok) return true
+    if (response.status === 404) return false
+    throw new Error(`the host refused to change a watch stream: HTTP ${response.status}`)
+  }
+}
+
+/** A stream's chunks, read without relying on streams being async iterable, which not every browser supports. */
+export async function* chunksOf<T>(stream: ReadableStream<T>): AsyncGenerator<T> {
+  const reader = stream.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return
+      yield value
+    }
+  } finally {
+    // Ends the stream when its reader stops early; one already ended or broken has nothing to cancel.
+    reader.cancel().catch(() => {})
+  }
+}
+
+/** Split a stream of text into lines, holding back an unfinished last line until it ends. */
+export async function* linesOf(chunks: AsyncIterable<string>): AsyncGenerator<string> {
+  let buffer = ''
+  for await (const chunk of chunks) {
+    buffer += chunk
+    let cut: number
+    while ((cut = buffer.indexOf('\n')) >= 0) {
+      yield buffer.slice(0, cut)
+      buffer = buffer.slice(cut + 1)
     }
   }
 }

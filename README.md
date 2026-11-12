@@ -69,8 +69,9 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
    - **Restart workspace** — e.g. after editing `~/.dsh/.env`.
    - **Start in recovery mode** — dsh without their own settings, plugins and `~/.env`, to fix them; **Leave recovery mode** returns.
    - **Reset my settings…** — sets `~/.dsh/profiles/web/cordis.patch.yml` aside as `.bak-<time>` and restarts.
-5. In dsh, a link to a folder (in a reply, or anywhere dsh opens files) opens a folder view in the
-   right sidebar; files and folders have download buttons (folders as ZIP). See "Folder view and downloads".
+5. In dsh, the Files tab in the right sidebar follows the disk as it changes, and a link to a folder (in a
+   reply, or anywhere dsh opens files) opens that folder the same way; files and folders have download
+   buttons (folders as ZIP). See "Files tab and downloads".
 
 ## Components
 
@@ -78,7 +79,7 @@ over plain HTTP, and other shell users on the host are not treated as adversarie
 |---|---|---|---|
 | `control/` → `mu-dsh` | Python 3.11+, stdlib only | root | CLI, Unix accounts, provisioning, dsh install, supervising one dsh per user, PAM password checks |
 | `gateway/` | TypeScript on Node ≥ 23.6, no runtime dependencies | `mu-dsh` | login, per-user reverse proxy (HTTP + WebSocket), LLM relay |
-| `plugin/` → `mu-dsh-files` | TypeScript, a dsh plugin (built output in `plugin/lib/` is committed) | in each user's dsh and browser | folder view and downloads in dsh's web UI |
+| `plugin/` → `mu-dsh-files` | TypeScript, a dsh plugin (built output in `plugin/lib/` is committed) | in each user's dsh and browser | a Files tab with folder links and downloads in dsh's web UI |
 
 They share two things in `/run/mu-dsh`: `gateway.json` (users and process state,
 format in `control/state.py`), written by the Python side and watched by the
@@ -160,39 +161,62 @@ file is fixed. From there (or from `/`) the user can:
   stay installed.
 * **Restart workspace**, which also skips the retry backoff.
 
-### Folder view and downloads
+### Files tab and downloads
 
 `plugin/` is a dsh plugin, `mu-dsh-files`, which the defaults bundle mounts
 (the bundle lists it as a dependency, so dsh resolves it next to the bundle).
 It changes nothing in dsh itself; it uses the extension points dsh's web
 client has:
 
-* **Folder view.** In dsh's right sidebar every file address goes to one tab
-  type, chosen before anything can know whether the path is a file or a
-  folder. mu-dsh-files registers a tab type at the highest rank for all of
-  them; each such tab first asks the host what its path is. A directory stays
-  and is shown as a tree (expand folders inline, open files, go up a level,
-  reload). Anything else, including a missing path, is reopened in the tab's
-  place with the viewer dsh would otherwise have used, keeping the line a
-  link points at; repeated links reuse open tabs as before. The cost is one
-  small request before every file opens.
-* **Downloads.** A button in dsh's file preview header and in its "cannot
-  preview" state, on every row and the header of the folder view, and on the
-  Files tree header (the whole workspace). Folders download as a ZIP archive
-  named after them. The button asks first, so a refusal (dsh may not read a
-  file, a folder over 65,535 entries or 2 GiB) is said next to it, naming the
-  path; then the browser streams the download to disk.
+* **Files tab.** dsh's right sidebar lets a plugin take over a built-in tab
+  kind, and mu-dsh-files takes over `files`. dsh's guide card and its
+  Workspace files shortcut open it as before. It is a tree of the
+  session's working directory: expand folders inline, open files, go up
+  a level, reload. While it is visible it follows the disk: every folder
+  shown open is watched, and is listed again shortly after it changes.
+  If the watches stop (the connection dropped, say), a dot on the reload
+  button says changes may be missing until they are back.
+* **Folder links.** In the right sidebar, every file address goes to one
+  tab type, chosen before anything can know whether the path is a file or
+  a folder. The Files tab type claims all of them, ranked above dsh's
+  viewers, and each such tab first asks the host what its path is:
+  * A folder stays, as a Files tab rooted there. A link to the working
+    directory itself becomes the Files page.
+  * Anything else, including a missing path, reopens in the tab's place
+    with the viewer dsh would otherwise have used, keeping the line a link
+    points at.
 
-The host half adds two routes to dsh's `/api` (`mu-dsh-files.entry`,
-`mu-dsh-files.download`). dsh authenticates them like its own, and they read
-through dsh's filesystem service, so they reach exactly what the user's dsh
-may read, as the user.
+  Repeated links reuse open tabs as before. The cost is one small request
+  before every file opens.
+* **Downloads.** There is a download button:
+  * in dsh's file preview header and its "cannot preview" state;
+  * on every row and on the header of a Files tab.
+
+  Folders download as a ZIP archive named after them. The button asks
+  first, so a refusal is shown next to it, naming the path: dsh may not
+  read the file, or the folder is over 65,535 entries or 2 GiB. Then the
+  browser streams the download to disk.
+
+The host half adds three routes to dsh's `/api`: `mu-dsh-files.entry`,
+`mu-dsh-files.download`, and `mu-dsh-files.watch`. dsh authenticates them
+like its own, and they go through dsh's filesystem service, so they reach
+exactly what the user's dsh may read, as the user.
+
+Watching works like this:
+* A browser page holds one long-lived stream (newline-delimited JSON, with
+  a ping every 20 s).
+* It names the folders to watch with small requests beside the stream.
+* The host keeps each watch up:
+  * it retries a failed watch with backoff;
+  * it watches again when a path becomes, or stops being, a folder;
+  * it reports at most one change per folder per second.
+* A page that loses its stream opens another and asks again.
 
 The plugin uses dsh's internal web client APIs, so a dsh upgrade can break it.
 It is built so that this costs only its own features: its parts wait for the
 dsh services they use and register as one unit, and if any part fails, dsh
-starts without them (its preview, links and Files tree work as without the
-plugin) and the browser console says why. A user can turn it off for
+starts without them (its preview, links and its own Files tab work as without
+the plugin) and the browser console says why. A user can turn it off for
 themselves with a row in their profile patch: `- id: mu-dsh-files` /
 `disabled: true`.
 
@@ -280,7 +304,7 @@ prefixed with its user; relay requests are logged per user).
 ```sh
 python3 -m unittest discover -s tests/unit      # control plane (host)
 cd gateway && node --test test/                 # gateway (host)
-cd plugin && node --test test/                  # dsh plugin routes and folder logic (host)
+cd plugin && node --test test/                  # dsh plugin routes, watches and tree logic (host)
 cd plugin && node build.mjs --check             # plugin/lib matches plugin/src (after pnpm install)
 python3 tests/vm/vm.py test                     # full system tests in a QEMU VM
 ```
@@ -329,8 +353,10 @@ pin dsh's packages at the version in `packaging/config.example.toml`).
   their dsh is started by mu-dsh.
 * All enabled users' dsh instances start at boot (one Node process each).
 * mu-dsh-files is built and tested against the pinned dsh version. After
-  changing `[dsh] version`, check the folder view; if dsh's client API moved,
-  the plugin's features are missing (dsh itself is unaffected) until it is
-  updated.
-* The folder view lists a folder when it is opened, expanded or reloaded; it
-  does not watch for changes as dsh's Files tree does.
+  changing `[dsh] version`, check the Files tab. If dsh's client API moved,
+  the plugin's features are missing until it is updated. dsh itself is
+  unaffected, and its own Files tab comes back.
+* A proxy in front of the gateway must pass the watch stream through without
+  buffering it. The host asks nginx not to buffer it, with
+  `X-Accel-Buffering: no`; other proxies may need their own setting.
+  Otherwise the Files tab only changes when reloaded.

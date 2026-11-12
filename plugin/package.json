@@ -1,9 +1,9 @@
 {
   "name": "mu-dsh-files",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "mu-dsh's dsh plugin: linked folders open as a folder view in the right sidebar, and files and folders download from the web UI",
+  "description": "mu-dsh's dsh plugin: a Files tab that follows the disk and takes over dsh's own, folder links that open in it, and downloads of files and folders from the web UI",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
@@ -44,9 +44,11 @@
     "@deepseek-ai/dsh-session": "0.2.1-rc.5",
     "@deepseek-ai/dsh-util-workspace-path": "0.2.1-rc.5",
     "@types/node": "^24.0.0",
+    "@types/picomatch": "^4.0.3",
     "@types/react": "18.3.31",
     "esbuild": "0.28.2",
     "fflate": "0.8.2",
+    "picomatch": "4.0.7",
     "typescript": "^5.9.0"
   }
 }

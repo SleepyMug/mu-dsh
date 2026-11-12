@@ -2,12 +2,13 @@
  * A plain node:fs implementation of the routes' `Files`, behaving like dsh's
  * local backend where the routes depend on it: targets keyed by real path,
  * symlinks followed, short reads at end of file, errors carrying FS_ codes.
+ * Its watches report only when a test fires them.
  */
 
 import { open, readdir, realpath, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { FsDirEntry, FsInfo, FsTarget } from '@deepseek-ai/dsh-fs'
-import type { Files } from '../src/files.ts'
+import type { WatchFiles } from '../src/files.ts'
 
 class FakeFsError extends Error {
   readonly code: string
@@ -39,11 +40,17 @@ async function info(path: string): Promise<FsInfo | undefined> {
   }
 }
 
-export class LocalFiles implements Files {
+export class LocalFiles implements WatchFiles {
   /** Paths whose listing fails as permission denied, for refusal tests. */
   readonly denied = new Set<string>()
   /** Every byte range read, in order. */
   readonly reads: Array<{ path: string; offset: number; length: number }> = []
+  /** Paths whose watch fails to start. */
+  readonly unwatchable = new Set<string>()
+  /** Open watches' callbacks, by path. */
+  readonly watching = new Map<string, Set<(error?: Error) => void>>()
+  /** Every watch started, by path, in order. */
+  readonly watched: string[] = []
 
   /** Like dsh's: a path that does not exist resolves to itself; any other failure escapes as the system error. */
   async resolve(path: string): Promise<FsTarget> {
@@ -94,5 +101,23 @@ export class LocalFiles implements Files {
     } finally {
       await handle.close()
     }
+  }
+
+  async watch(t: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>> {
+    signal.throwIfAborted()
+    if (this.unwatchable.has(t.displayPath)) throw new Error(`cannot watch ${t.displayPath}`)
+    this.watched.push(t.displayPath)
+    const callbacks = this.watching.get(t.displayPath) ?? new Set()
+    callbacks.add(changed)
+    this.watching.set(t.displayPath, callbacks)
+    return async () => {
+      callbacks.delete(changed)
+      if (callbacks.size === 0 && this.watching.get(t.displayPath) === callbacks) this.watching.delete(t.displayPath)
+    }
+  }
+
+  /** Report a change (or, with `error`, a broken watch) to every watch of `path`. */
+  fire(path: string, error?: Error): void {
+    for (const changed of [...this.watching.get(path) ?? []]) changed(error)
   }
 }

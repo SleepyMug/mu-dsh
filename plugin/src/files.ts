@@ -5,13 +5,18 @@
  */
 
 import type { FsDirEntry, FsInfo, FsTarget } from '@deepseek-ai/dsh-fs'
-import type { RefusalCode } from './wire.ts'
+import type { Refusal, RefusalCode } from './wire.ts'
 
 export interface Files {
   resolve(path: string, opts?: { signal?: AbortSignal }): Promise<FsTarget>
   stat(target: FsTarget, signal?: AbortSignal): Promise<FsInfo | undefined>
   listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]>
   readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array>
+}
+
+/** The watch route's part: `ctx.fs.watch`, which observes a file or a directory's direct entries. */
+export interface WatchFiles extends Files {
+  watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>>
 }
 
 export type { FsTarget }
@@ -39,6 +44,17 @@ export function fsErrorCode(error: unknown): string | undefined {
   const code = (error as { code?: unknown }).code
   if (typeof code !== 'string') return undefined
   return code.startsWith('FS_') ? code : ERRNO[code]
+}
+
+/**
+ * A failure as a refusal the browser can show. A watch may fail with an
+ * ordinary exception (dsh says so of watch initialization), which is not a
+ * bug of this plugin but a fact about the path, so it is reported too.
+ */
+export function refusalOf(error: unknown): Refusal {
+  const code = fsErrorCode(error)
+  const message = error instanceof Error ? error.message : String(error)
+  return { error: code === undefined ? 'unavailable' : refusalFor(code).error, message }
 }
 
 /** How a filesystem refusal reaches the browser. */

@@ -150,6 +150,16 @@ class Browser:
     def get(self, path: str) -> Response:
         return self.request("GET", path)
 
+    def stream(self, path: str) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+        """Start a GET whose body the caller reads as it arrives; the caller closes the connection."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        headers = {"Host": self.authority}
+        cookie = self.cookie_header(path.split("?")[0])
+        if cookie:
+            headers["Cookie"] = cookie
+        conn.request("GET", path, headers=headers)
+        return conn, conn.getresponse()
+
     def follow(self, path: str, limit: int = 10) -> list[Response]:
         chain = []
         for _ in range(limit):
@@ -491,6 +501,32 @@ class SystemTest(unittest.TestCase):
         self.assertIn("bob", head.header("x-mu-dsh-refusal") or "")
         # And bob cannot reach alice's routes at all.
         self.assertEqual(self.signed_in("bob").get(f"{api}.entry?path=/home/alice").status, 403)
+
+        # Watching, through the gateway: one stream, the paths to watch asked for beside it,
+        # and a change reported as it happens.
+        conn, stream = b.stream(f"{api}.watch")
+        try:
+            self.assertEqual(stream.status, 200)
+            self.assertEqual(stream.getheader("x-accel-buffering"), "no")
+
+            def event() -> dict:
+                while True:
+                    line = stream.readline()
+                    self.assertTrue(line, "the watch stream ended")
+                    parsed = json.loads(line)
+                    if parsed["type"] != "ping":
+                        return parsed
+
+            opened = event()
+            self.assertEqual(opened["type"], "open")
+            control = b.request("POST", f"{api}.watch", json.dumps({"stream": opened["stream"], "add": ["/home/alice/results"]}).encode(),
+                                {"Content-Type": "application/json"})
+            self.assertEqual(control.status, 200, control.body)
+            self.assertEqual(event(), {"type": "ready", "path": "/home/alice/results"})
+            self.sh("runuser -u alice -- touch /home/alice/results/new.txt")
+            self.assertEqual(event(), {"type": "change", "path": "/home/alice/results"})
+        finally:
+            conn.close()
 
     def test_12_crash_recovery(self):
         b = self.signed_in("alice")

@@ -42,6 +42,8 @@ const TEXT = `
 .mdf-tool:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
 .mdf-tool:disabled{opacity:.5;cursor:default}
 .mdf-tool[data-state=refused]{color:var(--dsw-alias-state-error,#d93025)}
+.mdf-tool[data-state=stale]{position:relative}
+.mdf-tool[data-state=stale]::after{content:'';position:absolute;top:5px;right:5px;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-warning,#e8a317)}
 .mdf-body{scrollbar-gutter:stable;flex:auto;min-height:0;margin-right:2px;padding:8px 0 8px 8px;overflow:auto}
 .mdf-level{margin:0;padding:0;list-style:none}
 .mdf-level .mdf-level{padding-left:18px}

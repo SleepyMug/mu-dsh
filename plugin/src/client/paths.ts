@@ -1,6 +1,15 @@
 /** Addresses and paths, without a browser or a host. */
 
 import { isAbsoluteWorkspacePath, parseFileAddress, resolveWorkspacePath, workspaceTitleOf } from '@deepseek-ai/dsh-util-workspace-path'
+import type { Origin } from './tree.ts'
+
+/**
+ * Every file address, as the sidebar's glob matcher reads it. dsh's file
+ * preview claims file addresses with the same pattern; `dsh-resource://file/**`
+ * would not do, because a globstar matches no `.` or `..` segment, so a link
+ * to `.` or `../out` would pass this type by.
+ */
+export const FILE_ADDRESS_PATTERN = 'dsh-resource://file/[\\s\\S]+'
 
 /** `/a/b/` → `/a/b`; `/` stays itself. */
 export function trimSlashes(path: string): string {
@@ -50,4 +59,17 @@ export function titleOf(address: string, cwdOf: (sessionId: string) => string | 
   if (!workspaceItself) return nameOf(where.path)
   const cwd = cwdOf(where.sessionId)
   return cwd === undefined ? '/' : workspaceTitleOf(cwd) || cwd
+}
+
+/** The session an address belongs to: its own for a session file address, the tab's for the Files page. */
+export function sessionOf<S extends string>(contentId: string, tabSession: S): S {
+  const address = parseFileAddress(contentId)
+  return address?.scope === 'session' ? address.sessionId as S : tabSession
+}
+
+/** What a tab shows, from its content id: the Files page has a page address, a folder tab a file address. */
+export function originOf(contentId: string, cwd: string | undefined): Origin {
+  const workspace = cwd === undefined || cwd === '' ? undefined : trimSlashes(cwd)
+  if (parseFileAddress(contentId) === undefined) return { kind: 'workspace', root: workspace }
+  return { kind: 'address', path: sessionPathOf(contentId, () => workspace)?.absolute, workspace }
 }
